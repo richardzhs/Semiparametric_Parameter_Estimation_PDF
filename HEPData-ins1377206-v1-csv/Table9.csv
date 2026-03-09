@@ -1,0 +1,21 @@
+#: table_doi: 10.17182/hepdata.68951.v1/t9
+#: name: Table 9
+#: description: Structure function $xF_3^{\gamma Z}$ averaged over $Q^2 \ge 1000$ GeV$^2$ at the scale 1000 GeV$^2$.
+
+#: data_file: Table9.yaml
+#: keyword reactions: E+ P --> E+ X | E- P --> E- X
+#: keyword observables: XF3
+#: keyword phrases: Inclusive | Structure Function | Electron production | Neutral Current | Deep Inelastic Scattering
+#: RE,E+- P --> E+- X
+Q**2 [GEV**2],XB,$xF_3^{\gamma Z}$,stat +,stat -,sys +,sys -
+1000.0,0.014,0.422,0.12,-0.12,0.082,-0.082
+1000.0,0.02,0.443,0.08,-0.08,0.051,-0.051
+1000.0,0.032,0.334,0.058,-0.058,0.034,-0.034
+1000.0,0.05,0.312,0.045,-0.045,0.023,-0.023
+1000.0,0.08,0.365,0.033,-0.033,0.016,-0.016
+1000.0,0.13,0.523,0.035,-0.035,0.014,-0.014
+1000.0,0.18,0.423,0.032,-0.032,0.011,-0.011
+1000.0,0.25,0.407,0.031,-0.031,0.011,-0.011
+1000.0,0.4,0.245,0.028,-0.028,0.009,-0.009
+1000.0,0.65,0.026,0.017,-0.017,0.007,-0.007
+
