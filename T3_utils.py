@@ -16,6 +16,7 @@ from scipy.interpolate import BSpline
 from scipy.integrate import quad, fixed_quad
 from scipy.linalg import cho_factor, cho_solve
 from scipy.optimize import minimize
+from scipy.stats import norm
 import pandas as pd
 from matplotlib import pyplot as plt
 
@@ -774,6 +775,138 @@ def one_step_c(D, K, K_prime, beta_hat, c_hat, w_norm, Sigma=None, s2_diag=None)
 
     return c_one_step, info
 
+def one_step_confidence_interval(c_one_step_info, alpha=0.05):
+    """
+    Confidence interval for c based on the one-step estimator and its EIF.
+
+    Parameters
+    ----------
+    c_one_step_info : dict, info returned by one_step_estimator.
+    alpha : float, significance level (default 0.05 for 95% CI).
+
+    Returns
+    -------
+    ci_lower : float, lower bound of the confidence interval.
+    ci_upper : float, upper bound of the confidence interval.
+    """
+
+    c_one_step = c_one_step_info["c_hat"] + c_one_step_info["eif"]
+    se = np.sqrt(1 / c_one_step_info["den"])
+    z = norm.ppf(1 - alpha / 2)
+    ci_lower = c_one_step - z * se
+    ci_upper = c_one_step + z * se
+    return ci_lower, ci_upper, se
+
+def bootstrap_confidence_interval(
+    A, w_norm, xQ2, Sigma,
+    c_hat, beta_hat,
+    c0=0, n_boot=500,
+    alpha=0.05,
+    ci_method="normal",
+    estimator="one_step",
+    opt="joint",
+    c_opt="scipy_optimize",
+    beta_opt="SLSQP",
+    nonneg_beta=True,
+    fix_ends=False,
+    loss_scale=1,
+    klin=klin, kquad=kquad,
+    seed=None,
+    verbose=True,
+):
+    """
+    Parametric bootstrap CI for c (plug-in MLE or one-step estimator).
+
+    Resamples D* ~ N(mu_hat, Sigma) where mu_hat = v_c(c_hat) * A @ beta_hat,
+    refits the model on each replicate, and returns a percentile CI.
+
+    Parameters
+    ----------
+    A : (N, M) design matrix.
+    w_norm : (M,) normalization weights for the sum-rule constraint.
+    xQ2 : (N, 2) array of (x, Q^2) pairs.
+    Sigma : (N, N) covariance matrix of the data.
+    c_hat : float, plug-in MLE of c from the original fit.
+    beta_hat : (M,) plug-in MLE of beta from the original fit.
+    c0 : float, initial guess for c in each bootstrap fit (default 0).
+    n_boot : int, number of bootstrap replicates (default 500).
+    alpha : float, significance level (default 0.05 for 95% CI).
+    estimator : {"one_step", "mle"}
+        Which estimator to collect across replicates.
+    opt : {"joint", "separate"}, fitting strategy (must match the original fit).
+    c_opt : str, optimizer for the c step (when opt="separate").
+    beta_opt : str, optimizer for the beta step.
+    nonneg_beta : bool, enforce non-negativity of beta.
+    fix_ends : bool, fix endpoint basis coefficients.
+    loss_scale : float, scale factor for the loss.
+    ci_method : {"normal", "percentile"}
+        "normal"     — use bootstrap SE with a normal z-interval:
+                       c_hat ± z * std(boot_samples).
+        "percentile" — use the [alpha/2, 1-alpha/2] quantiles directly.
+    klin, kquad : callables, Wilson coefficient functions.
+    seed : int or None, random seed for reproducibility.
+    verbose : bool, print progress every 50 replicates.
+
+    Returns
+    -------
+    ci_lower : float
+    ci_upper : float
+    boot_samples : (n_boot,) array of per-replicate estimates (NaN for failures).
+    """
+    _klin, _kquad = klin, kquad
+    _v_c       = lambda c, xQ2: v_c(c, xQ2, klin=_klin, kquad=_kquad)
+    _v_prime_c = lambda c, xQ2: v_prime_c(c, xQ2, klin=_klin, kquad=_kquad)
+
+    mu_hat = true_mean_basis(c_hat, beta_hat, A, xQ2, klin=_klin, kquad=_kquad)
+    rng = np.random.default_rng(seed)
+    boot_samples = np.full(n_boot, np.nan)
+
+    for b in range(n_boot):
+        if verbose and (b + 1) % 50 == 0:
+            print(f"  Bootstrap replicate {b+1}/{n_boot}")
+        D_star = rng.multivariate_normal(mu_hat, Sigma)
+        try:
+            if opt == "joint":
+                res = fit_beta_c(D_star, A, _v_c, _v_prime_c, w_norm, xQ2,
+                                 Sigma=Sigma, nonneg_beta=nonneg_beta,
+                                 fix_ends=fix_ends, opt_method=beta_opt,
+                                 return_history=False, loss_scale=loss_scale)
+                beta_b, c_b = res.beta_hat, res.c_hat
+            else:  # separate
+                beta_b = mle_beta(D=D_star, A=A, c=c0, v=_v_c, xQ2=xQ2,
+                                  Sigma=Sigma, w_norm=w_norm,
+                                  nonneg_beta=nonneg_beta, fix_ends=fix_ends,
+                                  beta_opt=beta_opt, return_history=False,
+                                  loss_scale=loss_scale)
+                c_b = mle_c(D=D_star, A=A, v=_v_c, beta=beta_b, xQ2=xQ2,
+                            Sigma=Sigma, c_opt=c_opt)
+
+            if estimator == "mle":
+                boot_samples[b] = c_b
+            else:
+                K_b       = build_K_matrix(c_b, A, xQ2, klin=_klin, kquad=_kquad)
+                K_prime_b = build_K_prime_matrix(c_b, A, xQ2, klin=_klin, kquad=_kquad)
+                c_os_b, _ = one_step_c(D_star, K_b, K_prime_b, beta_b, c_b,
+                                       w_norm, Sigma=Sigma)
+                boot_samples[b] = c_os_b
+        except Exception as e:
+            if verbose:
+                print(f"  Replicate {b+1} failed: {e}")
+
+    n_failed = np.sum(~np.isfinite(boot_samples))
+    if n_failed:
+        print(f"Warning: {n_failed}/{n_boot} replicates failed and were excluded.")
+
+    if ci_method == "normal":
+        se_boot = float(np.nanstd(boot_samples, ddof=1))
+        z = norm.ppf(1 - alpha / 2)
+        ci_lower = c_hat - z * se_boot
+        ci_upper = c_hat + z * se_boot
+    else:  # percentile
+        ci_lower = float(np.nanpercentile(boot_samples, 100 * alpha / 2))
+        ci_upper = float(np.nanpercentile(boot_samples, 100 * (1 - alpha / 2)))
+    return ci_lower, ci_upper, boot_samples
+
 
 # =============================================================================
 # 5. Plotting
@@ -788,8 +921,11 @@ def plot_by_Q2(
     series_styles=None,
     default_style=None,
     show_legend=True,
+    legend_fontsize=None,
     sort_x_within_panel=True,
     q2_round_decimals=12,
+    q2_filter=None,
+    alpha=0.05,
 ):
     """
     Plot one or multiple series grouped into Q^2 panels.
@@ -808,15 +944,26 @@ def plot_by_Q2(
         Use log scale on the x-axis.
     series_styles : dict, optional
         Per-series style dict; may include 'kind' in {"line", "scatter"} plus
-        any matplotlib kwargs.
+        any matplotlib kwargs.  To add error bars for a series, include
+        'cov': a (n_pts, n_pts) covariance matrix — the half-width is
+        z * sqrt(diag(cov)) where z = norm.ppf(1 - alpha/2).
     default_style : dict, optional
         Fallback style dict.
     show_legend : bool
         Show legend in the first panel.
+    legend_fontsize : int or float, optional
+        Font size for the legend text. If None, uses matplotlib's default.
     sort_x_within_panel : bool
         Sort points by x within each Q^2 panel before plotting.
     q2_round_decimals : int
         Rounding precision for grouping Q^2 values (avoids float-equality issues).
+    q2_filter : list/array or callable, optional
+        Subset of Q^2 values to plot. If a list/array, only panels whose Q^2
+        is in the list (matched within q2_round_decimals precision) are shown.
+        If callable, it receives the Q^2 value and must return True to include it.
+    alpha : float, optional
+        Significance level for error bars (default 0.05, i.e. 95% CI).  Only
+        used when a series provides a 'cov' key in series_styles.
     """
     xQ2 = np.asarray(xQ2, dtype=float)
     if xQ2.ndim != 2 or xQ2.shape[1] != 2:
@@ -858,11 +1005,22 @@ def plot_by_Q2(
     idx_groups = [idx_groups[i] for i in order]
     q2_values = [q2_values[i] for i in order]
 
+    if q2_filter is not None:
+        if callable(q2_filter):
+            keep = [q2_filter(q) for q in q2_values]
+        else:
+            filter_keys = np.round(np.asarray(q2_filter, dtype=float), q2_round_decimals)
+            keep = [np.round(q, q2_round_decimals) in filter_keys for q in q2_values]
+        idx_groups = [g for g, k in zip(idx_groups, keep) if k]
+        q2_values = [q for q, k in zip(q2_values, keep) if k]
+
     n_Q2 = len(idx_groups)
     nrows = int(np.ceil(float(n_Q2) / float(ncols)))
 
     fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 3 * nrows), sharex=True)
     axes = np.atleast_1d(axes).ravel()
+
+    z = norm.ppf(1.0 - alpha / 2.0)
 
     for i, (idx, q2_val) in enumerate(zip(idx_groups, q2_values)):
         ax = axes[i]
@@ -877,7 +1035,16 @@ def plot_by_Q2(
             style = default_style.copy()
             style.update(series_styles.get(lab, {}))
             kind = style.pop("kind", "line")
-            if kind == "scatter":
+            cov = style.pop("cov", None)
+            if cov is not None:
+                cov = np.asarray(cov, dtype=float)
+                err_i = z * np.sqrt(np.diag(cov)[idxp])
+                fmt = style.pop("fmt", "o" if kind == "scatter" else "-o")
+                s = style.pop("s", None)
+                if s is not None and "markersize" not in style:
+                    style["markersize"] = np.sqrt(s)
+                ax.errorbar(x_i, y_i, yerr=err_i, fmt=fmt, label=lab, **style)
+            elif kind == "scatter":
                 ax.scatter(x_i, y_i, label=lab, **style)
             else:
                 ax.plot(x_i, y_i, label=lab, **style)
@@ -887,7 +1054,7 @@ def plot_by_Q2(
         ax.grid(True)
 
         if show_legend and i == 0:
-            ax.legend()
+            ax.legend(fontsize=legend_fontsize)
 
     for ax in axes[n_Q2:]:
         ax.axis("off")
@@ -1016,7 +1183,7 @@ def setup_experiment(pdf, c, f, xQ2, grid, degree, M, W,
     }
 
 
-def run_single_experiment(setup_dict, diagnostics=False):
+def run_single_experiment(setup_dict, diagnostics=False, show_plots=True):
     """
     Run one experiment: generate data, fit (beta, c), apply one-step correction.
 
@@ -1025,7 +1192,10 @@ def run_single_experiment(setup_dict, diagnostics=False):
     setup_dict : dict
         Returned by setup_experiment().
     diagnostics : bool
-        If True, print a results table and show diagnostic plots.
+        If True, compute and return info dict plus print a results table.
+    show_plots : bool
+        If True (and diagnostics=True), render diagnostic figures. Set to
+        False to get info without displaying any plots.
 
     Returns
     -------
@@ -1123,75 +1293,78 @@ def run_single_experiment(setup_dict, diagnostics=False):
 
     info = {}
 
-    # PDF fit plot
-    y_eval = np.linspace(x_min, x_max, 5000)
-    basis_fit = sum(b * Bk(y_eval) for b, Bk in zip(beta_hat, B))
-    fy_fit = basis_fit if parametrize == "f" else basis_fit / y_eval
+    if show_plots:
+        # PDF fit plot
+        y_eval = np.linspace(x_min, x_max, 5000)
+        basis_fit = sum(b * Bk(y_eval) for b, Bk in zip(beta_hat, B))
+        fy_fit = basis_fit if parametrize == "f" else basis_fit / y_eval
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-    axes[0].plot(y_eval, f(y_eval), lw=2.5, label="True $f(y)$")
-    axes[0].plot(y_eval, fy_fit, lw=2.5, ls="--", label=r"Fitted $\hat f(y)$")
-    axes[0].set_title("PDF fit")
-    axes[0].set_ylim(0, 5)
-    axes[0].set_xlabel("y")
-    axes[0].set_ylabel("f(y)")
-    axes[0].grid(True, color="0.85", linewidth=1.0)
-    axes[0].legend()
-    axes[1].plot(y_eval, y_eval * f(y_eval), lw=2.5, label="True $y f(y)$")
-    axes[1].plot(y_eval, y_eval * fy_fit, lw=2.5, ls="--", label=r"Fitted $y \hat f(y)$")
-    axes[1].set_title("PDF fit")
-    axes[1].set_xlabel("y")
-    axes[1].set_ylabel("$y f(y)$")
-    axes[1].grid(True, color="0.85", linewidth=1.0)
-    axes[1].legend()
-    plt.tight_layout()
-    plt.show()
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+        axes[0].plot(y_eval, f(y_eval), lw=2.5, label="True $f(y)$")
+        axes[0].plot(y_eval, fy_fit, lw=2.5, ls="--", label=r"Fitted $\hat f(y)$")
+        axes[0].set_title("PDF fit")
+        axes[0].set_ylim(0, 5)
+        axes[0].set_xlabel("y")
+        axes[0].set_ylabel("f(y)")
+        axes[0].grid(True, color="0.85", linewidth=1.0)
+        axes[0].legend()
+        axes[1].plot(y_eval, y_eval * f(y_eval), lw=2.5, label="True $y f(y)$")
+        axes[1].plot(y_eval, y_eval * fy_fit, lw=2.5, ls="--", label=r"Fitted $y \hat f(y)$")
+        axes[1].set_title("PDF fit")
+        axes[1].set_xlabel("y")
+        axes[1].set_ylabel("$y f(y)$")
+        axes[1].grid(True, color="0.85", linewidth=1.0)
+        axes[1].legend()
+        plt.tight_layout()
+        plt.show()
 
-    # Mean fit by Q^2
-    plot_by_Q2(
-        {"T": T, "mu": mu, "mu_hat": mu_hat, "mu_one_step": mu_one_step, "Data": D},
-        xQ2=xQ2, ncols=ncol_plots, x_log_scale=x_log_scale,
-        series_styles={
-            "T":           dict(linestyle="-",  linewidth=3, color="C0"),
-            "mu":          dict(linestyle="--", linewidth=3, color="C1"),
-            "mu_hat":      dict(linestyle=":",  linewidth=3, color="C2"),
-            "mu_one_step": dict(linestyle="-.", linewidth=3, color="C3"),
-            "Data":        dict(kind="scatter", color="gray", s=30, alpha=0.7),
-        }
-    )
+        # Mean fit by Q^2
+        plot_by_Q2(
+            {"T": T, "mu": mu, "mu_hat": mu_hat, "mu_one_step": mu_one_step, "Data": D},
+            xQ2=xQ2, ncols=ncol_plots, x_log_scale=x_log_scale,
+            series_styles={
+                "T":           dict(linestyle="-",  linewidth=3, color="C0"),
+                "mu":          dict(linestyle="--", linewidth=3, color="C1"),
+                "mu_hat":      dict(linestyle=":",  linewidth=3, color="C2"),
+                "mu_one_step": dict(linestyle="-.", linewidth=3, color="C3"),
+                "Data":        dict(kind="scatter", color="gray", s=30, alpha=0.7),
+            }
+        )
 
-    # Convergence history
-    if return_history:
-        history_df = pd.DataFrame(history)
-        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-        axes[0, 0].plot(history_df['loss'], marker='o')
-        axes[0, 0].set_title("Negative Log-Likelihood")
-        axes[0, 0].set_xlabel("Iteration"); axes[0, 0].set_ylabel("NLL"); axes[0, 0].grid()
-        axes[0, 1].plot(history_df['constr_viol'], marker='o')
-        axes[0, 1].set_title("Constraint Violation (w^T beta - 1)")
-        axes[0, 1].set_xlabel("Iteration"); axes[0, 1].set_ylabel("Violation"); axes[0, 1].grid()
-        axes[1, 0].plot(history_df['grad_norm'], marker='o')
-        axes[1, 0].set_title("Gradient Norm")
-        axes[1, 0].set_xlabel("Iteration"); axes[1, 0].set_ylabel("||grad||"); axes[1, 0].grid()
-        axes[1, 1].plot(history_df['beta_norm'], marker='o')
-        axes[1, 1].set_title("Beta Norm")
-        axes[1, 1].set_xlabel("Iteration"); axes[1, 1].set_ylabel("||beta||"); axes[1, 1].grid()
+        # Convergence history
+        if return_history:
+            history_df = pd.DataFrame(history)
+            fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+            axes[0, 0].plot(history_df['loss'], marker='o')
+            axes[0, 0].set_title("Negative Log-Likelihood")
+            axes[0, 0].set_xlabel("Iteration"); axes[0, 0].set_ylabel("NLL"); axes[0, 0].grid()
+            axes[0, 1].plot(history_df['constr_viol'], marker='o')
+            axes[0, 1].set_title("Constraint Violation (w^T beta - 1)")
+            axes[0, 1].set_xlabel("Iteration"); axes[0, 1].set_ylabel("Violation"); axes[0, 1].grid()
+            axes[1, 0].plot(history_df['grad_norm'], marker='o')
+            axes[1, 0].set_title("Gradient Norm")
+            axes[1, 0].set_xlabel("Iteration"); axes[1, 0].set_ylabel("||grad||"); axes[1, 0].grid()
+            axes[1, 1].plot(history_df['beta_norm'], marker='o')
+            axes[1, 1].set_title("Beta Norm")
+            axes[1, 1].set_xlabel("Iteration"); axes[1, 1].set_ylabel("||beta||"); axes[1, 1].grid()
 
-    # Numerical summary
-    results_df = pd.DataFrame({
-        "Parameter": ["c_hat", "c_one_step", "True c"] + [f"beta_{m}" for m in range(M)],
-        "Value": np.concatenate([[c_hat, c_one_step, c], beta_hat])
-    })
-    print(results_df.round(6))
-    print("Normalization constraint (w^T beta_hat):", float(w_norm @ beta_hat))
-    fy_integral = fixed_quad(
-        lambda y: sum(b * Bk(y) for b, Bk in zip(beta_hat, B)) / (y if parametrize == "xf" else 1.0),
-        x_min, x_max, n=1000
-    )[0]
-    print(f"Fitted pdf integrates to ({parametrize} parametrize):", fy_integral)
+        # Numerical summary
+        results_df = pd.DataFrame({
+            "Parameter": ["c_hat", "c_one_step", "True c"] + [f"beta_{m}" for m in range(M)],
+            "Value": np.concatenate([[c_hat, c_one_step, c], beta_hat])
+        })
+        print(results_df.round(6))
+        print("Normalization constraint (w^T beta_hat):", float(w_norm @ beta_hat))
+        fy_integral = fixed_quad(
+            lambda y: sum(b * Bk(y) for b, Bk in zip(beta_hat, B)) / (y if parametrize == "xf" else 1.0),
+            x_min, x_max, n=1000
+        )[0]
+        print(f"Fitted pdf integrates to ({parametrize} parametrize):", fy_integral)
 
     info['mle'] = res
     info['one_step'] = one_step_info
+    info['D'] = D
+    info['beta_hat'] = beta_hat
     return c_hat, c_one_step, info
 
 
