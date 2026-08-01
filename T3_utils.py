@@ -11,6 +11,8 @@ Sections
 6. Experiment
 """
 
+from functools import partial
+
 import numpy as np
 from scipy.interpolate import BSpline
 from scipy.integrate import quad, fixed_quad
@@ -19,6 +21,7 @@ from scipy.optimize import minimize
 from scipy.stats import norm
 import pandas as pd
 from matplotlib import pyplot as plt
+import matplotlib.gridspec as gridspec
 
 
 # =============================================================================
@@ -280,9 +283,78 @@ def make_nll_and_grad(D, A, v, v_prime, xQ2, Sigma=None):
     return nll, grad
 
 
-def fit_beta_c(D, A, v, v_prime, w_norm, xQ2, Sigma=None, beta0=None, c0=0.0,
-               nonneg_beta=False, fix_ends=False, return_history=False,
-               opt_method="SLSQP", loss_scale=1):
+class _BetaLayout:
+    """Manages the free/pinned beta index layout and normalization helpers."""
+
+    def __init__(self, M, w_norm, pin_endpoints):
+        if w_norm is not None and w_norm.shape[0] != M:
+            raise ValueError(f"w_norm must have length M={M}, got {w_norm.shape[0]}")
+        if pin_endpoints:
+            if M < 3:
+                raise ValueError("Need at least M >= 3 when pin_endpoints=True.")
+            self.s = slice(1, M - 1)
+        else:
+            self.s = slice(0, M)
+        self.M = M
+        self.M_free = self.s.stop - self.s.start
+        self.w_free = w_norm[self.s] if w_norm is not None else None
+        if self.M_free < 1:
+            raise ValueError("No free beta coefficients to optimize.")
+
+    def build_full(self, beta_free):
+        beta_full = np.zeros(self.M)
+        beta_full[self.s] = beta_free
+        return beta_full
+
+    def extract_free(self, beta_full):
+        return np.asarray(beta_full)[self.s].copy()
+
+    def normalize_free(self, beta_free):
+        denom = float(self.w_free @ beta_free)
+        if abs(denom) < 1e-15:
+            raise ValueError("Cannot normalize beta: w_free @ beta_free is zero or too close to zero.")
+        return beta_free / denom
+
+    def random_free(self, nonneg_beta):
+        b = np.random.rand(self.M_free)
+        if nonneg_beta:
+            b = np.abs(b)
+        return self.normalize_free(b) if self.w_free is not None else b
+
+    def init_free(self, beta0, nonneg_beta, pin_endpoints, verbose=False):
+        if beta0 is None:
+            return self.random_free(nonneg_beta)
+        beta0 = np.asarray(beta0, dtype=float).copy()
+        if beta0.shape[0] != self.M:
+            raise ValueError(f"beta0 must have length M={self.M}, got {beta0.shape[0]}")
+        if pin_endpoints:
+            beta0[0] = 0.0
+            beta0[-1] = 0.0
+        beta0_free = self.extract_free(beta0)
+        if self.w_free is not None and abs(self.w_free @ beta0_free - 1.0) > 1e-10:
+            if verbose:
+                print("Initial beta0 does not satisfy the normalization constraint on free coefficients:",
+                      "w_free @ beta0_free =", self.w_free @ beta0_free)
+            beta0_free = self.normalize_free(beta0_free)
+        if verbose and nonneg_beta and np.any(beta0_free < 0):
+            print("Initial beta0 has negative free entries.")
+        return beta0_free
+
+
+def _run_with_restarts(minimize_fn, theta0, gen_theta, num_try, history=None):
+    """Run minimize_fn(theta0); on failure retry with gen_theta() up to num_try times."""
+    res = minimize_fn(theta0)
+    while not res.success and num_try > 0:
+        if history is not None:
+            history.clear()
+        res = minimize_fn(gen_theta())
+        num_try -= 1
+    return res
+
+
+def fit_beta_c(D, A, v, v_prime, w_norm=None, xQ2=None, Sigma=None, beta0=None, c0=0.0,
+               nonneg_beta=False, pin_endpoints=False, return_history=False,
+               opt_method="SLSQP", loss_scale=1, num_try=10):
     """
     Joint MLE of (beta, c) via constrained minimization of the negative log-likelihood.
 
@@ -292,16 +364,18 @@ def fit_beta_c(D, A, v, v_prime, w_norm, xQ2, Sigma=None, beta0=None, c0=0.0,
     A : (N, M) design matrix.
     v : callable, v(c, xQ2) -> (N,) vector.
     v_prime : callable, v_prime(c, xQ2) -> (N,) derivative vector.
-    w_norm : (M,) normalization weights satisfying w_norm @ beta = 1.
+    w_norm : (M,) normalization weights enforcing w_norm @ beta = 1, or None for
+        unconstrained optimization.
     xQ2 : (N, 2) array of (x, Q^2) pairs.
     Sigma : (N, N) covariance, or None for identity.
     beta0 : (M,) initial beta, or None for random initialization.
     c0 : float, initial c.
     nonneg_beta : bool, enforce beta >= 0.
-    fix_ends : bool, fix beta[0] = beta[-1] = 0.
+    pin_endpoints : bool, fix beta[0] = beta[-1] = 0.
     return_history : bool, if True return (res, history).
     opt_method : "SLSQP" or "trust-constr".
     loss_scale : float, scale factor for the loss (useful for numerical stability).
+    num_try : int, number of random initializations to try for the optimization.
 
     Returns
     -------
@@ -309,52 +383,10 @@ def fit_beta_c(D, A, v, v_prime, w_norm, xQ2, Sigma=None, beta0=None, c0=0.0,
     history : list of per-iteration dicts (only if return_history=True).
     """
     N, M = A.shape
-    if w_norm.shape[0] != M:
-        raise ValueError(f"w_norm must have length M={M}, got {w_norm.shape[0]}")
+    layout = _BetaLayout(M, w_norm, pin_endpoints)
+    M_free, w_free = layout.M_free, layout.w_free
 
-    if fix_ends:
-        if M < 3:
-            raise ValueError("Need at least M >= 3 when fix_ends=True.")
-        beta_slice = slice(1, M - 1)
-    else:
-        beta_slice = slice(0, M)
-
-    M_free = beta_slice.stop - beta_slice.start
-    w_free = w_norm[beta_slice]
-
-    if M_free < 1:
-        raise ValueError("No free beta coefficients to optimize.")
-
-    def build_full_beta(beta_free):
-        beta_full = np.zeros(M)
-        beta_full[beta_slice] = beta_free
-        return beta_full
-
-    def extract_free_beta(beta_full):
-        return np.asarray(beta_full)[beta_slice].copy()
-
-    def normalize_free_beta(beta_free):
-        denom = float(w_free @ beta_free)
-        if abs(denom) < 1e-15:
-            raise ValueError("Cannot normalize beta: w_free @ beta_free is zero or too close to zero.")
-        return beta_free / denom
-
-    if beta0 is None:
-        b = np.random.rand(M_free)
-        if nonneg_beta:
-            b = np.abs(b)
-        beta0_free = normalize_free_beta(b)
-    else:
-        beta0 = np.asarray(beta0, dtype=float).copy()
-        if beta0.shape[0] != M:
-            raise ValueError(f"beta0 must have length M={M}, got {beta0.shape[0]}")
-        if fix_ends:
-            beta0[0] = 0.0
-            beta0[-1] = 0.0
-        beta0_free = extract_free_beta(beta0)
-        if abs(w_free @ beta0_free - 1.0) > 1e-10:
-            beta0_free = normalize_free_beta(beta0_free)
-
+    beta0_free = layout.init_free(beta0, nonneg_beta, pin_endpoints)
     theta0 = np.r_[beta0_free, c0]
 
     nll, grad = make_nll_and_grad(D, A, v, v_prime, xQ2=xQ2, Sigma=Sigma)
@@ -362,7 +394,7 @@ def fit_beta_c(D, A, v, v_prime, w_norm, xQ2, Sigma=None, beta0=None, c0=0.0,
     def unpack_theta(theta):
         beta_free = theta[:M_free]
         c = theta[-1]
-        beta_full = build_full_beta(beta_free)
+        beta_full = layout.build_full(beta_free)
         return beta_full, c
 
     def nll_scaled(theta):
@@ -372,13 +404,16 @@ def fit_beta_c(D, A, v, v_prime, w_norm, xQ2, Sigma=None, beta0=None, c0=0.0,
     def grad_scaled(theta):
         beta_full, c = unpack_theta(theta)
         g_full = grad(np.r_[beta_full, c]) / loss_scale
-        return np.r_[g_full[:M][beta_slice], g_full[-1]]
+        return np.r_[g_full[:M][layout.s], g_full[-1]]
 
-    cons = [{
-        "type": "eq",
-        "fun": lambda x: float(w_free @ x[:M_free] - 1.0),
-        "jac": lambda x: np.r_[w_free, 0.0]
-    }]
+    if w_free is not None:
+        cons = [{
+            "type": "eq",
+            "fun": lambda x: float(w_free @ x[:M_free] - 1.0),
+            "jac": lambda x: np.r_[w_free, 0.0]
+        }]
+    else:
+        cons = []
 
     history = [] if return_history else None
 
@@ -386,10 +421,11 @@ def fit_beta_c(D, A, v, v_prime, w_norm, xQ2, Sigma=None, beta0=None, c0=0.0,
         if not return_history:
             return
         beta_full, c = unpack_theta(theta)
+        constr_viol = (float(state.constr_violation) if state is not None
+                       else (float(abs(w_free @ theta[:M_free] - 1.0)) if w_free is not None else 0.0))
         history.append({
             "loss": float(state.fun) if state is not None else float(nll_scaled(theta)),
-            "constr_viol": (float(state.constr_violation)
-                            if state is not None else float(abs(w_free @ theta[:M_free] - 1.0))),
+            "constr_viol": constr_viol,
             "grad_norm": (float(state.optimality)
                           if state is not None else float(np.linalg.norm(grad_scaled(theta)))),
             "beta_norm": float(np.linalg.norm(beta_full)),
@@ -408,28 +444,21 @@ def fit_beta_c(D, A, v, v_prime, w_norm, xQ2, Sigma=None, beta0=None, c0=0.0,
     else:
         raise ValueError(f"Unsupported optimization method: {opt_method}")
 
-    res = minimize(nll_scaled, theta0, jac=grad_scaled, method=opt_method,
-                   constraints=cons, bounds=bounds, options=options,
-                   callback=callback if return_history else None)
+    def do_minimize(t0):
+        return minimize(nll_scaled, t0, jac=grad_scaled, method=opt_method,
+                        constraints=cons, bounds=bounds, options=options,
+                        callback=callback if return_history else None)
 
-    num_try = 10
-    while not res.success and num_try > 0:
-        b = np.random.rand(M_free)
-        if nonneg_beta:
-            b = np.abs(b)
-        beta0_free = normalize_free_beta(b)
-        theta0 = np.r_[beta0_free, c0]
-        if return_history:
-            history.clear()
-        res = minimize(nll_scaled, theta0, jac=grad_scaled, method=opt_method,
-                       constraints=cons, bounds=bounds, options=options,
-                       callback=callback if return_history else None)
-        num_try -= 1
+    res = _run_with_restarts(
+        do_minimize, theta0,
+        gen_theta=lambda: np.r_[layout.random_free(nonneg_beta), c0],
+        num_try=num_try, history=history,
+    )
 
     if not res.success:
         print(f"Optimization failed: {res.message}")
 
-    res.beta_hat = build_full_beta(res.x[:M_free])
+    res.beta_hat = layout.build_full(res.x[:M_free])
     res.c_hat = res.x[-1]
 
     if return_history:
@@ -437,8 +466,8 @@ def fit_beta_c(D, A, v, v_prime, w_norm, xQ2, Sigma=None, beta0=None, c0=0.0,
     return res
 
 
-def mle_beta(D, A, c, v, xQ2, w_norm, Sigma=None, beta0=None, nonneg_beta=True,
-             fix_ends=False, beta_opt="SLSQP", return_history=False, loss_scale=1):
+def mle_beta(D, A, c, v, xQ2, w_norm=None, Sigma=None, beta0=None, nonneg_beta=True,
+             pin_endpoints=False, beta_opt="SLSQP", return_history=False, loss_scale=1, num_try=10):
     """
     MLE of beta given a fixed c.
 
@@ -449,14 +478,16 @@ def mle_beta(D, A, c, v, xQ2, w_norm, Sigma=None, beta0=None, nonneg_beta=True,
     c : float, fixed Wilson coefficient.
     v : callable, v(c, xQ2) -> (N,) vector.
     xQ2 : (N, 2) array of (x, Q^2) pairs.
-    w_norm : (M,) normalization weights (w_norm @ beta = 1).
+    w_norm : (M,) normalization weights enforcing w_norm @ beta = 1, or None for
+        unconstrained optimization.
     Sigma : (N, N) covariance, or None for identity.
     beta0 : (M,) initial guess, or None for random initialization.
     nonneg_beta : bool, enforce beta >= 0.
-    fix_ends : bool, fix beta[0] = beta[-1] = 0.
+    pin_endpoints : bool, fix beta[0] = beta[-1] = 0.
     beta_opt : "SLSQP", "trust-constr", or "closed_form".
     return_history : bool, if True return (beta_hat, history).
     loss_scale : float, scale factor for the loss.
+    num_try : int, number of random initializations to try for the optimization.
 
     Returns
     -------
@@ -464,35 +495,8 @@ def mle_beta(D, A, c, v, xQ2, w_norm, Sigma=None, beta0=None, nonneg_beta=True,
     history : list of per-iteration dicts (only if return_history=True).
     """
     N, M = A.shape
-    if w_norm.shape[0] != M:
-        raise ValueError(f"w_norm must have length M={M}, got {w_norm.shape[0]}")
-
-    if fix_ends:
-        if M < 3:
-            raise ValueError("Need at least M >= 3 when fix_ends=True.")
-        beta_slice = slice(1, M - 1)
-    else:
-        beta_slice = slice(0, M)
-
-    M_free = beta_slice.stop - beta_slice.start
-    w_free = w_norm[beta_slice]
-
-    if M_free < 1:
-        raise ValueError("No free beta coefficients to optimize.")
-
-    def build_full_beta(beta_free):
-        beta_full = np.zeros(M)
-        beta_full[beta_slice] = beta_free
-        return beta_full
-
-    def extract_free_beta(beta_full):
-        return np.asarray(beta_full)[beta_slice].copy()
-
-    def normalize_free_beta(beta_free):
-        denom = float(w_free @ beta_free)
-        if abs(denom) < 1e-15:
-            raise ValueError("Cannot normalize beta: w_free @ beta_free is zero or too close to zero.")
-        return beta_free / denom
+    layout = _BetaLayout(M, w_norm, pin_endpoints)
+    M_free, w_free = layout.M_free, layout.w_free
 
     if Sigma is not None:
         cF, lower = cho_factor(Sigma, check_finite=False)
@@ -501,46 +505,25 @@ def mle_beta(D, A, c, v, xQ2, w_norm, Sigma=None, beta0=None, nonneg_beta=True,
         Sigma_inv = lambda z: z
 
     vc = v(c, xQ2=xQ2)
-
-    if beta0 is None:
-        b = np.random.rand(M_free)
-        if nonneg_beta:
-            b = np.abs(b)
-        beta0_free = normalize_free_beta(b)
-    else:
-        beta0 = np.asarray(beta0, dtype=float).copy()
-        if beta0.shape[0] != M:
-            raise ValueError(f"beta0 must have length M={M}, got {beta0.shape[0]}")
-        if fix_ends:
-            beta0[0] = 0.0
-            beta0[-1] = 0.0
-        beta0_free = extract_free_beta(beta0)
-        if abs(w_free @ beta0_free - 1.0) > 1e-10:
-            print("Initial beta0 does not satisfy the normalization constraint on free coefficients:",
-                  "w_free @ beta0_free =", w_free @ beta0_free)
-            beta0_free = normalize_free_beta(beta0_free)
-        if nonneg_beta and np.any(beta0_free < 0):
-            print("Initial beta0 has negative free entries.")
+    vcA = vc[:, None] * A  # precomputed; fixed since c is fixed
+    beta0_free = layout.init_free(beta0, nonneg_beta, pin_endpoints, verbose=True)
 
     if beta_opt in ("SLSQP", "trust-constr"):
-        def loss(beta_free):
-            beta_full = build_full_beta(beta_free)
-            mu = vc * (A @ beta_full)
-            r = D - mu
-            return 0.5 * r @ Sigma_inv(r)
+        def loss_and_grad(beta_free):
+            r = D - vc * (A @ layout.build_full(beta_free))
+            Sinv_r = Sigma_inv(r)
+            f = 0.5 * r @ Sinv_r
+            g = -(vcA.T @ Sinv_r)[layout.s]
+            return f / loss_scale, g / loss_scale
 
-        def grad(beta_free):
-            beta_full = build_full_beta(beta_free)
-            mu = vc * (A @ beta_full)
-            r = D - mu
-            g_full = -(vc[:, None] * A).T @ Sigma_inv(r)
-            return g_full[beta_slice]
-
-        cons = {
-            'type': 'eq',
-            'fun': lambda beta_free: float(w_free @ beta_free - 1.0),
-            'jac': lambda beta_free: w_free
-        }
+        if w_free is not None:
+            cons = {
+                'type': 'eq',
+                'fun': lambda beta_free: float(w_free @ beta_free - 1.0),
+                'jac': lambda beta_free: w_free
+            }
+        else:
+            cons = []
 
         if nonneg_beta:
             bounds = [(0.0, None)] * M_free
@@ -552,14 +535,18 @@ def mle_beta(D, A, c, v, xQ2, w_norm, Sigma=None, beta0=None, nonneg_beta=True,
         def callback(beta_free, state=None):
             if not return_history:
                 return
-            beta_full = build_full_beta(beta_free)
+            constr_viol = (float(state.constr_violation) if state is not None
+                           else (float(abs(w_free @ beta_free - 1.0)) if w_free is not None else 0.0))
+            if state is not None:
+                loss_val, grad_norm = float(state.fun), float(state.optimality)
+            else:
+                f, g = loss_and_grad(beta_free)
+                loss_val, grad_norm = float(f), float(np.linalg.norm(g))
             history.append({
-                'loss': float(state.fun) if state is not None else float(loss(beta_free) / loss_scale),
-                'constr_viol': (float(state.constr_violation)
-                                if state is not None else float(abs(w_free @ beta_free - 1.0))),
-                'grad_norm': (float(state.optimality)
-                              if state is not None else float(np.linalg.norm(grad(beta_free) / loss_scale))),
-                'beta_norm': float(np.linalg.norm(beta_full)),
+                'loss': loss_val,
+                'constr_viol': constr_viol,
+                'grad_norm': grad_norm,
+                'beta_norm': float(np.linalg.norm(layout.build_full(beta_free))),
                 'beta_free_norm': float(np.linalg.norm(beta_free)),
             })
 
@@ -568,52 +555,44 @@ def mle_beta(D, A, c, v, xQ2, w_norm, Sigma=None, beta0=None, nonneg_beta=True,
         elif beta_opt == "trust-constr":
             options = dict(maxiter=5000, gtol=1e-10)
 
-        res = minimize(lambda bf: loss(bf) / loss_scale, beta0_free,
-                       jac=lambda bf: grad(bf) / loss_scale,
-                       method=beta_opt, constraints=cons, bounds=bounds,
-                       callback=callback if return_history else None, options=options)
+        def do_minimize(t0):
+            return minimize(loss_and_grad, t0, jac=True,
+                            method=beta_opt, constraints=cons, bounds=bounds,
+                            callback=callback if return_history else None, options=options)
 
-        num_try = 10
-        while not res.success and num_try > 0:
-            b = np.random.rand(M_free)
-            if nonneg_beta:
-                b = np.abs(b)
-            beta0_free = normalize_free_beta(b)
-            if return_history:
-                history.clear()
-            res = minimize(lambda bf: loss(bf) / loss_scale, beta0_free,
-                           jac=lambda bf: grad(bf) / loss_scale,
-                           method=beta_opt, constraints=cons, bounds=bounds,
-                           callback=callback if return_history else None, options=options)
-            num_try -= 1
+        res = _run_with_restarts(
+            do_minimize, beta0_free,
+            gen_theta=lambda: layout.random_free(nonneg_beta),
+            num_try=num_try, history=history,
+        )
 
         if not res.success:
             print(f"Optimization for beta failed: {res.message}")
 
-        beta_hat = build_full_beta(res.x)
+        beta_hat = layout.build_full(res.x)
         if return_history:
             return beta_hat, history
         return beta_hat
 
     elif beta_opt == "closed_form":
-        nu = np.asarray(v(c, xQ2=xQ2)).reshape(-1)
-        if nu.shape[0] != N:
-            raise ValueError(f"v(c) must return shape {(N,)}, got {nu.shape}.")
-        Wmat = nu[:, None] * A                                        # (N, M)
+        Wmat = vcA                                                    # (N, M)
         SinvW = np.column_stack([Sigma_inv(Wmat[:, j]) for j in range(M)])
         U = Wmat.T @ SinvW                                            # (M, M)
         b = Wmat.T @ Sigma_inv(D)                                     # (M,)
 
-        KKT = np.zeros((M + 1, M + 1), dtype=float)
-        KKT[:M, :M] = U
-        KKT[:M, M] = w_norm
-        KKT[M, :M] = w_norm
-        rhs = np.zeros(M + 1, dtype=float)
-        rhs[:M] = b
-        rhs[M] = 1.0
-        sol = np.linalg.solve(KKT, rhs)
+        if w_norm is not None:
+            KKT = np.zeros((M + 1, M + 1), dtype=float)
+            KKT[:M, :M] = U
+            KKT[:M, M] = w_norm
+            KKT[M, :M] = w_norm
+            rhs = np.zeros(M + 1, dtype=float)
+            rhs[:M] = b
+            rhs[M] = 1.0
+            sol = np.linalg.solve(KKT, rhs)
+            beta_hat = sol[:M]
+        else:
+            beta_hat = np.linalg.solve(U, b)
 
-        beta_hat = sol[:M]
         if nonneg_beta and np.any(beta_hat < 0):
             raise ValueError("Closed-form beta has negative entries; try 'SLSQP' or 'trust-constr'.")
         return beta_hat
@@ -621,7 +600,8 @@ def mle_beta(D, A, c, v, xQ2, w_norm, Sigma=None, beta0=None, nonneg_beta=True,
         raise ValueError("Invalid beta_opt method.")
 
 
-def mle_c(D, A, v, beta, xQ2, Sigma=None, c_opt="scipy_optimize"):
+
+def mle_c(D, A, v, beta, xQ2, Sigma=None, c_opt="scipy_optimize", c_range=(-5.0, 5.0)):
     """
     MLE of c given a fixed beta.
 
@@ -634,6 +614,7 @@ def mle_c(D, A, v, beta, xQ2, Sigma=None, c_opt="scipy_optimize"):
     xQ2 : (N, 2) array of (x, Q^2) pairs.
     Sigma : (N, N) covariance, or None for identity.
     c_opt : "scipy_optimize" or "grid_search".
+    c_range: tuple (c_min, c_max) for grid search, default (-5.0, 5.0).
 
     Returns
     -------
@@ -652,27 +633,30 @@ def mle_c(D, A, v, beta, xQ2, Sigma=None, c_opt="scipy_optimize"):
         r = D - mu
         return 0.5 * r @ Sigma_inv(r)
 
-    if c_opt == "scipy_optimize":
+    if c_opt == "L-BFGS-B":
         res = minimize(lambda c: nll(c), x0=0.0, method='L-BFGS-B')
-        if not res.success:
-            res = minimize(lambda c: nll(c), x0=0.0, method='Nelder-Mead')
-            if not res.success:
-                raise RuntimeError(f"Optimization failed: {res.message}")
-        return res.x[0]
+    elif c_opt == "Nelder-Mead":
+        res = minimize(lambda c: nll(c), x0=0.0, method='Nelder-Mead')
     elif c_opt == "grid_search":
-        c_grid = np.linspace(-5.0, 5.0, 1000)
+        c_min, c_max = c_range
+        c_grid = np.linspace(c_min, c_max, 1000)
         nll_values = np.array([nll(c) for c in c_grid])
-        return c_grid[np.argmin(nll_values)]
+        return float(c_grid[np.argmin(nll_values)])
     else:
         raise ValueError("Invalid c_opt method.")
+    if not res.success:
+        raise RuntimeError(f"Optimization failed: {res.message}")
+    return float(res.x[0])
 
 
-def one_step_c(D, K, K_prime, beta_hat, c_hat, w_norm, Sigma=None, s2_diag=None):
+def one_step_c(D, K, K_prime, beta_hat, c_hat, w_norm=None, Sigma=None, s2_diag=None):
     """
     One-step estimator for c using the efficient influence function (EIF).
 
     The nuisance parameter beta is constrained to the tangent space
-    {h : w_norm @ h = 0}, and the EIF is projected accordingly.
+    {h : w_norm @ h = 0}, and the EIF is projected accordingly. If
+    w_norm is None, no constraint is enforced and h is projected onto
+    the unconstrained tangent space (plain least-squares projection).
 
     Parameters
     ----------
@@ -681,7 +665,7 @@ def one_step_c(D, K, K_prime, beta_hat, c_hat, w_norm, Sigma=None, s2_diag=None)
     K_prime : (N, M) derivative dmu/dc = K_prime @ beta.
     beta_hat : (M,) plug-in estimate of beta.
     c_hat : float, plug-in estimate of c.
-    w_norm : (M,) normalization weights.
+    w_norm : (M,) normalization weights, or None to skip the constraint.
     Sigma : (N, N) full covariance, or None.
     s2_diag : (N,) diagonal variance vector (preferred over full Sigma when diagonal).
 
@@ -692,7 +676,8 @@ def one_step_c(D, K, K_prime, beta_hat, c_hat, w_norm, Sigma=None, s2_diag=None)
     """
     D = np.asarray(D).reshape(-1)
     beta_hat = np.asarray(beta_hat).reshape(-1)
-    w_norm = np.asarray(w_norm).reshape(-1)
+    if w_norm is not None:
+        w_norm = np.asarray(w_norm).reshape(-1)
     K = np.asarray(K)
     K_prime = np.asarray(K_prime)
 
@@ -704,7 +689,7 @@ def one_step_c(D, K, K_prime, beta_hat, c_hat, w_norm, Sigma=None, s2_diag=None)
         raise ValueError(f"K_prime must have shape {(N, M)}, got {K_prime.shape}.")
     if beta_hat.shape[0] != M:
         raise ValueError(f"beta_hat has length {beta_hat.shape[0]} but K has {M} cols.")
-    if w_norm.shape[0] != M:
+    if w_norm is not None and w_norm.shape[0] != M:
         raise ValueError(f"w_norm has length {w_norm.shape[0]} but K has {M} cols.")
 
     if s2_diag is not None:
@@ -736,20 +721,28 @@ def one_step_c(D, K, K_prime, beta_hat, c_hat, w_norm, Sigma=None, s2_diag=None)
     U = 2 * K.T @ SinvK                           # (M, M)
     b = 2 * K.T @ Sigma_inv(mu_prime_hat)         # (M,)
 
-    # Constrained projection: minimize ||mu' - K h||^2_{Sigma^{-1}} s.t. w^T h = 0
-    KKT = np.block([
-        [U,                    w_norm[:, None]],
-        [w_norm[None, :],      np.zeros((1, 1))]
-    ])
-    rhs = np.concatenate([b, np.array([0.0])])
+    if w_norm is None:
+        # Unconstrained projection: minimize ||mu' - K h||^2_{Sigma^{-1}}
+        try:
+            h_star = np.linalg.solve(U, b)
+        except np.linalg.LinAlgError:
+            h_star = np.linalg.lstsq(U, b, rcond=None)[0]
+        lam = None
+    else:
+        # Constrained projection: minimize ||mu' - K h||^2_{Sigma^{-1}} s.t. w^T h = 0
+        KKT = np.block([
+            [U,                    w_norm[:, None]],
+            [w_norm[None, :],      np.zeros((1, 1))]
+        ])
+        rhs = np.concatenate([b, np.array([0.0])])
 
-    try:
-        sol = np.linalg.solve(KKT, rhs)
-    except np.linalg.LinAlgError:
-        sol = np.linalg.lstsq(KKT, rhs, rcond=None)[0]
+        try:
+            sol = np.linalg.solve(KKT, rhs)
+        except np.linalg.LinAlgError:
+            sol = np.linalg.lstsq(KKT, rhs, rcond=None)[0]
 
-    h_star = sol[:M]
-    lam = float(sol[M])
+        h_star = sol[:M]
+        lam = float(sol[M])
 
     delta_hat = mu_prime_hat - K @ h_star
 
@@ -769,8 +762,8 @@ def one_step_c(D, K, K_prime, beta_hat, c_hat, w_norm, Sigma=None, s2_diag=None)
         "den": den,
         "eif": eif,
         "lambda": lam,
-        "w_dot_beta": float(w_norm @ beta_hat),
-        "w_dot_h": float(w_norm @ h_star),
+        "w_dot_beta": float(w_norm @ beta_hat) if w_norm is not None else None,
+        "w_dot_h": float(w_norm @ h_star) if w_norm is not None else None,
     }
 
     return c_one_step, info
@@ -798,17 +791,19 @@ def one_step_confidence_interval(c_one_step_info, alpha=0.05):
     return ci_lower, ci_upper, se
 
 def bootstrap_confidence_interval(
-    A, w_norm, xQ2, Sigma,
+    A, xQ2, Sigma,
     c_hat, beta_hat,
+    w_norm=None,
     c0=0, n_boot=500,
     alpha=0.05,
     ci_method="normal",
     estimator="one_step",
     opt="joint",
     c_opt="scipy_optimize",
+    c_range=(-5.0, 5.0),
     beta_opt="SLSQP",
     nonneg_beta=True,
-    fix_ends=False,
+    pin_endpoints=False,
     loss_scale=1,
     klin=klin, kquad=kquad,
     seed=None,
@@ -823,11 +818,12 @@ def bootstrap_confidence_interval(
     Parameters
     ----------
     A : (N, M) design matrix.
-    w_norm : (M,) normalization weights for the sum-rule constraint.
     xQ2 : (N, 2) array of (x, Q^2) pairs.
     Sigma : (N, N) covariance matrix of the data.
     c_hat : float, plug-in MLE of c from the original fit.
     beta_hat : (M,) plug-in MLE of beta from the original fit.
+    w_norm : (M,) normalization weights for the sum-rule constraint, or None
+        to skip the constraint (default None).
     c0 : float, initial guess for c in each bootstrap fit (default 0).
     n_boot : int, number of bootstrap replicates (default 500).
     alpha : float, significance level (default 0.05 for 95% CI).
@@ -835,9 +831,12 @@ def bootstrap_confidence_interval(
         Which estimator to collect across replicates.
     opt : {"joint", "separate"}, fitting strategy (must match the original fit).
     c_opt : str, optimizer for the c step (when opt="separate").
+    c_range : tuple (c_min, c_max)
+        Search range passed to ``mle_c`` when ``opt="separate"`` and
+        ``c_opt="grid_search"``.
     beta_opt : str, optimizer for the beta step.
     nonneg_beta : bool, enforce non-negativity of beta.
-    fix_ends : bool, fix endpoint basis coefficients.
+    pin_endpoints : bool, fix endpoint basis coefficients.
     loss_scale : float, scale factor for the loss.
     ci_method : {"normal", "percentile"}
         "normal"     — use bootstrap SE with a normal z-interval:
@@ -861,25 +860,30 @@ def bootstrap_confidence_interval(
     rng = np.random.default_rng(seed)
     boot_samples = np.full(n_boot, np.nan)
 
+    # Sigma is fixed across replicates, so factor it once instead of letting
+    # rng.multivariate_normal redo an SVD of Sigma on every draw.
+    N = mu_hat.shape[0]
+    L = np.linalg.cholesky(Sigma)
+
     for b in range(n_boot):
         if verbose and (b + 1) % 50 == 0:
             print(f"  Bootstrap replicate {b+1}/{n_boot}")
-        D_star = rng.multivariate_normal(mu_hat, Sigma)
+        D_star = mu_hat + L @ rng.standard_normal(N)
         try:
             if opt == "joint":
-                res = fit_beta_c(D_star, A, _v_c, _v_prime_c, w_norm, xQ2,
-                                 Sigma=Sigma, nonneg_beta=nonneg_beta,
-                                 fix_ends=fix_ends, opt_method=beta_opt,
+                res = fit_beta_c(D_star, A, _v_c, _v_prime_c, c0=c0, w_norm=w_norm, xQ2=xQ2,
+                                 Sigma=Sigma, nonneg_beta=nonneg_beta, 
+                                 pin_endpoints=pin_endpoints, opt_method=beta_opt,
                                  return_history=False, loss_scale=loss_scale)
                 beta_b, c_b = res.beta_hat, res.c_hat
             else:  # separate
                 beta_b = mle_beta(D=D_star, A=A, c=c0, v=_v_c, xQ2=xQ2,
                                   Sigma=Sigma, w_norm=w_norm,
-                                  nonneg_beta=nonneg_beta, fix_ends=fix_ends,
+                                  nonneg_beta=nonneg_beta, pin_endpoints=pin_endpoints,
                                   beta_opt=beta_opt, return_history=False,
                                   loss_scale=loss_scale)
                 c_b = mle_c(D=D_star, A=A, v=_v_c, beta=beta_b, xQ2=xQ2,
-                            Sigma=Sigma, c_opt=c_opt)
+                            Sigma=Sigma, c_opt=c_opt, c_range=c_range)
 
             if estimator == "mle":
                 boot_samples[b] = c_b
@@ -887,7 +891,7 @@ def bootstrap_confidence_interval(
                 K_b       = build_K_matrix(c_b, A, xQ2, klin=_klin, kquad=_kquad)
                 K_prime_b = build_K_prime_matrix(c_b, A, xQ2, klin=_klin, kquad=_kquad)
                 c_os_b, _ = one_step_c(D_star, K_b, K_prime_b, beta_b, c_b,
-                                       w_norm, Sigma=Sigma)
+                                       w_norm=w_norm, Sigma=Sigma)
                 boot_samples[b] = c_os_b
         except Exception as e:
             if verbose:
@@ -917,15 +921,21 @@ def plot_by_Q2(
     xQ2,
     ncols=2,
     y_label="Value",
+    x_label=r"$x$",
     x_log_scale=False,
     series_styles=None,
     default_style=None,
     show_legend=True,
     legend_fontsize=None,
+    title_fontsize=None,
+    label_fontsize=None,
     sort_x_within_panel=True,
     q2_round_decimals=12,
     q2_filter=None,
     alpha=0.05,
+    pull=None,
+    pull_label="Pull",
+    pull_legend=False,
 ):
     """
     Plot one or multiple series grouped into Q^2 panels.
@@ -940,6 +950,8 @@ def plot_by_Q2(
         Number of subplot columns.
     y_label : str
         Y-axis label for every panel.
+    x_label : str
+        X-axis label for every panel.
     x_log_scale : bool
         Use log scale on the x-axis.
     series_styles : dict, optional
@@ -953,6 +965,10 @@ def plot_by_Q2(
         Show legend in the first panel.
     legend_fontsize : int or float, optional
         Font size for the legend text. If None, uses matplotlib's default.
+    title_fontsize : int or float, optional
+        Font size for the panel titles. If None, uses matplotlib's default.
+    label_fontsize : int or float, optional
+        Font size for the axis labels. If None, uses matplotlib's default.
     sort_x_within_panel : bool
         Sort points by x within each Q^2 panel before plotting.
     q2_round_decimals : int
@@ -964,6 +980,22 @@ def plot_by_Q2(
     alpha : float, optional
         Significance level for error bars (default 0.05, i.e. 95% CI).  Only
         used when a series provides a 'cov' key in series_styles.
+    pull : dict or list of dict, optional
+        If provided, draw a pull panel below each Q^2 panel.
+        Each entry must have keys:
+          "data"  : name of the data series (numerator: D - ref)
+          "ref"   : name of the prediction series (subtracted from data)
+        Optional keys per entry:
+          "label" : legend label for this pull series (default: "data vs ref")
+          "cov"   : (n_pts, n_pts) covariance for sigma; falls back to the
+                    'cov' in series_styles[data] if omitted
+          any other key is passed as a matplotlib scatter kwarg (color, s, etc.)
+        A single dict is treated as a one-element list.
+        Pull is defined as (data - ref) / sigma pointwise.
+    pull_label : str, optional
+        Y-axis label for the pull panels (default "Pull").
+    pull_legend : bool, optional
+        Whether to show a legend in the pull panels (default False).
     """
     xQ2 = np.asarray(xQ2, dtype=float)
     if xQ2.ndim != 2 or xQ2.shape[1] != 2:
@@ -1017,8 +1049,62 @@ def plot_by_Q2(
     n_Q2 = len(idx_groups)
     nrows = int(np.ceil(float(n_Q2) / float(ncols)))
 
-    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 3 * nrows), sharex=True)
-    axes = np.atleast_1d(axes).ravel()
+    # Normalize pull to a list of specs and resolve data/sigma for each
+    pull_specs = None
+    if pull is not None:
+        raw = pull if isinstance(pull, list) else [pull]
+        series_dict = dict(series)
+        pull_specs = []
+        for spec in raw:
+            spec = dict(spec)
+            data_name = spec.pop("data")
+            ref_name = spec.pop("ref")
+            label = spec.pop("label", f"{data_name} vs {ref_name}")
+            if data_name not in series_dict:
+                raise ValueError(f"pull 'data' series '{data_name}' not found in Y.")
+            if ref_name not in series_dict:
+                raise ValueError(f"pull 'ref' series '{ref_name}' not found in Y.")
+            cov = spec.pop("cov", None)
+            if cov is None:
+                cov = series_styles.get(data_name, {}).get("cov", None)
+            if cov is None:
+                raise ValueError(
+                    f"pull for '{data_name} vs {ref_name}' requires a 'cov' either "
+                    f"in the pull spec or in series_styles['{data_name}']."
+                )
+            sigma = np.sqrt(np.diag(np.asarray(cov, dtype=float)))
+            pull_specs.append({
+                "data_vec": series_dict[data_name],
+                "ref_vec": series_dict[ref_name],
+                "sigma": sigma,
+                "label": label,
+                "scatter_kw": spec,  # remaining keys → scatter kwargs
+            })
+
+    # Build figure: with pull, each grid cell has a main + pull sub-panel
+    if pull_specs is not None:
+        
+        fig = plt.figure(figsize=(6 * ncols, 4.5 * nrows))
+        outer_gs = gridspec.GridSpec(nrows, ncols, hspace=0.4, wspace=0.3)
+        main_axes, pull_axes_list = [], []
+        for r in range(nrows):
+            for c in range(ncols):
+                inner_gs = gridspec.GridSpecFromSubplotSpec(
+                    2, 1,
+                    subplot_spec=outer_gs[r, c],
+                    height_ratios=[3, 1],
+                    hspace=0.05,
+                )
+                main_ax = fig.add_subplot(inner_gs[0])
+                pull_ax = fig.add_subplot(inner_gs[1], sharex=main_ax)
+                main_axes.append(main_ax)
+                pull_axes_list.append(pull_ax)
+        axes = np.array(main_axes)
+        pull_axes_arr = np.array(pull_axes_list)
+    else:
+        fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 3 * nrows), sharex=True)
+        axes = np.atleast_1d(axes).ravel()
+        pull_axes_arr = None
 
     z = norm.ppf(1.0 - alpha / 2.0)
 
@@ -1049,22 +1135,55 @@ def plot_by_Q2(
             else:
                 ax.plot(x_i, y_i, label=lab, **style)
 
-        ax.set_title(r"$Q^2 = {:.6g}$".format(q2_val))
-        ax.set_ylabel(y_label)
+        ax.set_title(r"$Q^2 = {:.6g}$".format(q2_val), fontsize=title_fontsize)
+        ax.set_ylabel(y_label, fontsize=label_fontsize)
         ax.grid(True)
 
         if show_legend and i == 0:
             ax.legend(fontsize=legend_fontsize)
 
+        # Pull panel
+        if pull_specs is not None:
+            pax = pull_axes_arr[i]
+            for ps in pull_specs:
+                pull_vals = (ps["data_vec"][idxp] - ps["ref_vec"][idxp]) / ps["sigma"][idxp]
+                kw = {"s": 20}
+                kw.update(ps["scatter_kw"])
+                pax.scatter(x_i, pull_vals, label=ps["label"], **kw)
+            pax.axhline(0, color="black", linewidth=0.8, linestyle="--")
+            pax.set_ylabel(pull_label, fontsize=label_fontsize)
+            pax.grid(True)
+            if x_log_scale:
+                pax.set_xscale("log")
+            if pull_legend and len(pull_specs) > 1 and i == 0:
+                pax.legend(fontsize=legend_fontsize)
+
+    # Hide unused panels
     for ax in axes[n_Q2:]:
         ax.axis("off")
+    if pull_specs is not None:
+        for ax in pull_axes_arr[n_Q2:]:
+            ax.axis("off")
 
-    start = max(0, n_Q2 - ncols)
-    for ax in axes[start:n_Q2]:
-        ax.set_xlabel(r"$x$")
+    # X-axis labels on bottom-most visible panels
+    if pull_specs is not None:
+        for i in range(n_Q2):
+            r = i // ncols
+            is_bottom = (r == nrows - 1) or (i + ncols >= n_Q2)
+            if is_bottom:
+                pull_axes_arr[i].set_xlabel(x_label, fontsize=label_fontsize)
+    else:
+        start = max(0, n_Q2 - ncols)
+        for ax in axes[start:n_Q2]:
+            ax.set_xlabel(x_label, fontsize=label_fontsize)
 
-    plt.tight_layout()
-    plt.show()
+    if pull_specs is not None:
+        for ax in axes[:n_Q2]:
+            ax.tick_params(bottom=False, labelbottom=False)
+    else:
+        plt.tight_layout()
+
+    return fig
 
 
 # =============================================================================
@@ -1073,13 +1192,15 @@ def plot_by_Q2(
 
 def setup_experiment(pdf, c, f, xQ2, grid, degree, M, W,
                      data_var=None, data_Sigma=None, opt="joint",
-                     c_opt="scipy_optimize", beta_opt="SLSQP", Lambda=100,
+                     c_opt="scipy_optimize", c_range=(-5.0, 5.0),
+                     beta_opt="SLSQP", Lambda=100,
                      c0=0.0, beta0=None,
                      x_min=None, x_max=None, Q2_min=None, Q2_max=None,
-                     klin=klin, kquad=kquad,
-                     nonneg_beta=True, fix_ends=False, ncol_plots=4,
+                     klin_fn=None, kquad_fn=None,
+                     nonneg_beta=True, pin_endpoints=False, ncol_plots=4,
                      x_log_scale=True, parametrize="f",
-                     return_history=False, loss_scale=1):
+                     return_history=False, loss_scale=1, mle_constrained=True,
+                     one_step_constrained=True):
     """
     One-time setup for a simulation experiment.
 
@@ -1113,10 +1234,15 @@ def setup_experiment(pdf, c, f, xQ2, grid, degree, M, W,
         Fitting strategy: "joint" or "separate".
     c_opt : str
         Optimizer for c: "scipy_optimize" or "grid_search".
+    c_range : tuple (c_min, c_max)
+        Search range passed to ``mle_c`` when ``opt="separate"`` and
+        ``c_opt="grid_search"``.
     beta_opt : str
         Optimizer for beta: "SLSQP", "trust-constr", or "closed_form".
     Lambda : float
-        New-physics suppression scale (default 100).
+        New-physics suppression scale used to configure the default coefficient
+        functions (default 100). Ignored for a coefficient whose custom callable
+        is supplied.
     c0 : float
         Initial guess for c.
     beta0 : (M,) array, optional
@@ -1125,11 +1251,13 @@ def setup_experiment(pdf, c, f, xQ2, grid, degree, M, W,
         x range for the basis (typically pdf.xMin / pdf.xMax).
     Q2_min, Q2_max : float
         Q^2 range of the dataset.
-    klin, kquad : callable
-        Wilson coefficient functions (default: module-level klin/kquad).
+    klin_fn, kquad_fn : callable, optional
+        Fully configured coefficient functions with signature ``fn(Q2)``.
+        When omitted, the corresponding module-level function is bound to
+        ``Lambda``.
     nonneg_beta : bool
         Enforce beta >= 0.
-    fix_ends : bool
+    pin_endpoints : bool
         Fix beta[0] = beta[-1] = 0.
     ncol_plots : int
         Columns in diagnostic plots.
@@ -1142,6 +1270,15 @@ def setup_experiment(pdf, c, f, xQ2, grid, degree, M, W,
         Pass through to fitting routines for convergence diagnostics.
     loss_scale : float
         Scale factor for the loss function.
+    mle_constrained : bool
+        If True (default), enforce the normalization constraint w_norm @ beta = 1
+        during MLE fitting.  If False, fit beta without the constraint (w_norm is
+        still computed).
+    one_step_constrained : bool
+        If True (default), the one-step EIF correction projects the nuisance
+        direction h onto the tangent space {h : w_norm @ h = 0}.  If False,
+        the one-step correction is unconstrained (w_norm=None is passed to
+        one_step_c). Independent of `mle_constrained`.
 
     Returns
     -------
@@ -1152,8 +1289,11 @@ def setup_experiment(pdf, c, f, xQ2, grid, degree, M, W,
     if data_var is None and data_Sigma is None:
         raise ValueError("Must specify either data_var or data_Sigma.")
 
-    klin_local = lambda z: klin(z, Lambda=Lambda)
-    kquad_local = lambda z: kquad(z, Lambda=Lambda)
+    klin_local = partial(klin, Lambda=Lambda) if klin_fn is None else klin_fn
+    kquad_local = partial(kquad, Lambda=Lambda) if kquad_fn is None else kquad_fn
+
+    if not callable(klin_local) or not callable(kquad_local):
+        raise TypeError("klin_fn and kquad_fn must be callable or None.")
 
     T = T_sm_FK(f=f, W=W, grid=grid)
     mu = true_mean(c=c, T=T, xQ2=xQ2, klin=klin_local, kquad=kquad_local)
@@ -1174,12 +1314,13 @@ def setup_experiment(pdf, c, f, xQ2, grid, degree, M, W,
         'data_var': data_var, 'data_Sigma': data_Sigma,
         'x_min': x_min, 'x_max': x_max, 'Q2_min': Q2_min, 'Q2_max': Q2_max,
         'klin': klin_local, 'kquad': kquad_local,
-        'opt': opt, 'c_opt': c_opt, 'beta_opt': beta_opt,
+        'opt': opt, 'c_opt': c_opt, 'c_range': c_range, 'beta_opt': beta_opt,
         'c0': c0, 'beta0': beta0,
-        'nonneg_beta': nonneg_beta, 'fix_ends': fix_ends,
+        'nonneg_beta': nonneg_beta, 'pin_endpoints': pin_endpoints,
         'ncol_plots': ncol_plots, 'x_log_scale': x_log_scale,
         'parametrize': parametrize, 'return_history': return_history,
-        'loss_scale': loss_scale,
+        'loss_scale': loss_scale, 'mle_constrained': mle_constrained,
+        'one_step_constrained': one_step_constrained,
     }
 
 
@@ -1223,16 +1364,24 @@ def run_single_experiment(setup_dict, diagnostics=False, show_plots=True):
     _kquad     = setup_dict['kquad']
     opt             = setup_dict['opt']
     c_opt           = setup_dict['c_opt']
+    c_range         = setup_dict.get('c_range', (-5.0, 5.0))
     beta_opt        = setup_dict['beta_opt']
     c0              = setup_dict['c0']
     beta0           = setup_dict['beta0']
     nonneg_beta     = setup_dict['nonneg_beta']
-    fix_ends        = setup_dict['fix_ends']
+    pin_endpoints        = setup_dict['pin_endpoints']
     ncol_plots      = setup_dict['ncol_plots']
     x_log_scale     = setup_dict['x_log_scale']
     parametrize     = setup_dict['parametrize']
     return_history  = setup_dict['return_history']
     loss_scale      = setup_dict['loss_scale']
+    mle_constrained = setup_dict['mle_constrained']
+    one_step_constrained = setup_dict['one_step_constrained']
+
+    fit_w_norm = w_norm if mle_constrained else None
+    one_step_w_norm = w_norm if one_step_constrained else None
+    #print(f"Fitting with w_norm constraint: {fit_w_norm}, "
+    #      f"one-step constraint: {one_step_w_norm}")
 
     _v_c       = lambda c, xQ2: v_c(c, xQ2, klin=_klin, kquad=_kquad)
     _v_prime_c = lambda c, xQ2: v_prime_c(c, xQ2, klin=_klin, kquad=_kquad)
@@ -1248,32 +1397,32 @@ def run_single_experiment(setup_dict, diagnostics=False, show_plots=True):
     # MLE fitting
     if opt == "joint":
         if return_history:
-            res, history = fit_beta_c(D, A, _v_c, _v_prime_c, w_norm, xQ2,
+            res, history = fit_beta_c(D, A, _v_c, _v_prime_c, fit_w_norm, xQ2,
                                       Sigma=data_Sigma, nonneg_beta=nonneg_beta,
-                                      fix_ends=fix_ends, opt_method=beta_opt,
+                                      pin_endpoints=pin_endpoints, opt_method=beta_opt,
                                       return_history=True, loss_scale=loss_scale)
         else:
-            res = fit_beta_c(D, A, _v_c, _v_prime_c, w_norm, xQ2,
+            res = fit_beta_c(D, A, _v_c, _v_prime_c, fit_w_norm, xQ2,
                              Sigma=data_Sigma, nonneg_beta=nonneg_beta,
-                             fix_ends=fix_ends, opt_method=beta_opt,
+                             pin_endpoints=pin_endpoints, opt_method=beta_opt,
                              return_history=False, loss_scale=loss_scale)
         beta_hat = res.beta_hat
         c_hat    = res.c_hat
     elif opt == "separate":
         if return_history:
             beta_hat, history = mle_beta(D=D, A=A, c=c0, v=_v_c, xQ2=xQ2,
-                                         Sigma=data_Sigma, w_norm=w_norm, beta0=None,
-                                         nonneg_beta=nonneg_beta, fix_ends=fix_ends,
+                                         Sigma=data_Sigma, w_norm=fit_w_norm, beta0=None,
+                                         nonneg_beta=nonneg_beta, pin_endpoints=pin_endpoints,
                                          beta_opt=beta_opt, return_history=True,
                                          loss_scale=loss_scale)
         else:
             beta_hat = mle_beta(D=D, A=A, c=c0, v=_v_c, xQ2=xQ2,
-                                Sigma=data_Sigma, w_norm=w_norm, beta0=None,
-                                nonneg_beta=nonneg_beta, fix_ends=fix_ends,
+                                Sigma=data_Sigma, w_norm=fit_w_norm, beta0=None,
+                                nonneg_beta=nonneg_beta, pin_endpoints=pin_endpoints,
                                 beta_opt=beta_opt, return_history=False,
                                 loss_scale=loss_scale)
         c_hat = mle_c(D=D, A=A, v=_v_c, beta=beta_hat, xQ2=xQ2,
-                      Sigma=data_Sigma, c_opt=c_opt)
+                      Sigma=data_Sigma, c_opt=c_opt, c_range=c_range)
         res = {'beta_hat': beta_hat, 'c_hat': c_hat}
     else:
         raise ValueError(f"Invalid opt method: {opt!r}")
@@ -1284,7 +1433,7 @@ def run_single_experiment(setup_dict, diagnostics=False, show_plots=True):
     K       = build_K_matrix(c_hat, A, xQ2, klin=_klin, kquad=_kquad)
     K_prime = build_K_prime_matrix(c_hat, A, xQ2, klin=_klin, kquad=_kquad)
     c_one_step, one_step_info = one_step_c(D, K, K_prime, beta_hat, c_hat,
-                                           w_norm, Sigma=data_Sigma)
+                                           one_step_w_norm, Sigma=data_Sigma)
     mu_one_step = true_mean_basis(c_one_step, beta_hat, A, xQ2,
                                   klin=_klin, kquad=_kquad)
 
@@ -1320,13 +1469,13 @@ def run_single_experiment(setup_dict, diagnostics=False, show_plots=True):
 
         # Mean fit by Q^2
         plot_by_Q2(
-            {"T": T, "mu": mu, "mu_hat": mu_hat, "mu_one_step": mu_one_step, "Data": D},
+            {"T": T, "mu": mu, "mu_hat": mu_hat, "Data": D}, #"mu_one_step": mu_one_step,
             xQ2=xQ2, ncols=ncol_plots, x_log_scale=x_log_scale,
             series_styles={
                 "T":           dict(linestyle="-",  linewidth=3, color="C0"),
                 "mu":          dict(linestyle="--", linewidth=3, color="C1"),
                 "mu_hat":      dict(linestyle=":",  linewidth=3, color="C2"),
-                "mu_one_step": dict(linestyle="-.", linewidth=3, color="C3"),
+                #"mu_one_step": dict(linestyle="-.", linewidth=3, color="C3"),
                 "Data":        dict(kind="scatter", color="gray", s=30, alpha=0.7),
             }
         )
@@ -1370,11 +1519,13 @@ def run_single_experiment(setup_dict, diagnostics=False, show_plots=True):
 
 def experiment(c, f, xQ2, grid, W, degree, M,
                data_var=None, data_Sigma=None, opt="joint",
-               c_opt="scipy_optimize", beta_opt="SLSQP", c0=0.0, beta0=None,
+               c_opt="scipy_optimize", c_range=(-5.0, 5.0),
+               beta_opt="SLSQP", c0=0.0, beta0=None,
                Lambda=100, x_min=None, x_max=None, Q2_min=None, Q2_max=None,
-               klin=klin, kquad=kquad,
+               klin_fn=None, kquad_fn=None,
                nonneg_beta=True, diagnostics=False, ncol_plots=4,
-               x_log_scale=True, parametrize="f", return_history=False):
+               x_log_scale=True, parametrize="f", return_history=False,
+               mle_constrained=True, one_step_constrained=True):
     """
     Convenience wrapper: runs setup_experiment() then run_single_experiment().
 
@@ -1390,11 +1541,15 @@ def experiment(c, f, xQ2, grid, W, degree, M,
     setup_dict = setup_experiment(
         c=c, f=f, xQ2=xQ2, grid=grid, W=W, degree=degree, M=M,
         data_var=data_var, data_Sigma=data_Sigma,
-        opt=opt, c_opt=c_opt, beta_opt=beta_opt, c0=c0, beta0=beta0,
+        opt=opt, c_opt=c_opt, c_range=c_range,
+        beta_opt=beta_opt, c0=c0, beta0=beta0,
         Lambda=Lambda, x_min=x_min, x_max=x_max,
-        Q2_min=Q2_min, Q2_max=Q2_max, klin=klin, kquad=kquad,
+        Q2_min=Q2_min, Q2_max=Q2_max,
+        klin_fn=klin_fn, kquad_fn=kquad_fn,
         nonneg_beta=nonneg_beta, ncol_plots=ncol_plots,
         x_log_scale=x_log_scale, parametrize=parametrize,
+        mle_constrained=mle_constrained,
+        one_step_constrained=one_step_constrained,
         return_history=return_history,
     )
     return run_single_experiment(setup_dict, diagnostics)
