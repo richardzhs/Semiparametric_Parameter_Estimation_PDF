@@ -575,23 +575,29 @@ def mle_beta(D, A, c, v, xQ2, w_norm=None, Sigma=None, beta0=None, nonneg_beta=T
         return beta_hat
 
     elif beta_opt == "closed_form":
-        Wmat = vcA                                                    # (N, M)
-        SinvW = np.column_stack([Sigma_inv(Wmat[:, j]) for j in range(M)])
-        U = Wmat.T @ SinvW                                            # (M, M)
-        b = Wmat.T @ Sigma_inv(D)                                     # (M,)
+        # Solve in the same free-coordinate layout as the numerical
+        # optimizers so pin_endpoints=True is respected.
+        Wmat_free = vcA[:, layout.s]                                  # (N, M_free)
+        SinvW = np.column_stack(
+            [Sigma_inv(Wmat_free[:, j]) for j in range(M_free)]
+        )
+        U = Wmat_free.T @ SinvW                                      # (M_free, M_free)
+        b = Wmat_free.T @ Sigma_inv(D)                               # (M_free,)
 
-        if w_norm is not None:
-            KKT = np.zeros((M + 1, M + 1), dtype=float)
-            KKT[:M, :M] = U
-            KKT[:M, M] = w_norm
-            KKT[M, :M] = w_norm
-            rhs = np.zeros(M + 1, dtype=float)
-            rhs[:M] = b
-            rhs[M] = 1.0
+        if w_free is not None:
+            KKT = np.zeros((M_free + 1, M_free + 1), dtype=float)
+            KKT[:M_free, :M_free] = U
+            KKT[:M_free, M_free] = w_free
+            KKT[M_free, :M_free] = w_free
+            rhs = np.zeros(M_free + 1, dtype=float)
+            rhs[:M_free] = b
+            rhs[M_free] = 1.0
             sol = np.linalg.solve(KKT, rhs)
-            beta_hat = sol[:M]
+            beta_free = sol[:M_free]
         else:
-            beta_hat = np.linalg.solve(U, b)
+            beta_free = np.linalg.solve(U, b)
+
+        beta_hat = layout.build_full(beta_free)
 
         if nonneg_beta and np.any(beta_hat < 0):
             raise ValueError("Closed-form beta has negative entries; try 'SLSQP' or 'trust-constr'.")
@@ -649,7 +655,8 @@ def mle_c(D, A, v, beta, xQ2, Sigma=None, c_opt="scipy_optimize", c_range=(-5.0,
     return float(res.x[0])
 
 
-def one_step_c(D, K, K_prime, beta_hat, c_hat, w_norm=None, Sigma=None, s2_diag=None):
+def one_step_c(D, K, K_prime, beta_hat, c_hat, w_norm=None, Sigma=None,
+               s2_diag=None, pin_endpoints=False):
     """
     One-step estimator for c using the efficient influence function (EIF).
 
@@ -668,6 +675,10 @@ def one_step_c(D, K, K_prime, beta_hat, c_hat, w_norm=None, Sigma=None, s2_diag=
     w_norm : (M,) normalization weights, or None to skip the constraint.
     Sigma : (N, N) full covariance, or None.
     s2_diag : (N,) diagonal variance vector (preferred over full Sigma when diagonal).
+    pin_endpoints : bool
+        If True, beta[0] and beta[-1] are fixed and excluded from the nuisance
+        tangent space. The fitted mean and its c derivative still use the full
+        coefficient vector.
 
     Returns
     -------
@@ -691,6 +702,18 @@ def one_step_c(D, K, K_prime, beta_hat, c_hat, w_norm=None, Sigma=None, s2_diag=
         raise ValueError(f"beta_hat has length {beta_hat.shape[0]} but K has {M} cols.")
     if w_norm is not None and w_norm.shape[0] != M:
         raise ValueError(f"w_norm has length {w_norm.shape[0]} but K has {M} cols.")
+
+    layout = _BetaLayout(M, w_norm, pin_endpoints)
+    if pin_endpoints and not np.allclose(
+        beta_hat[[0, -1]], 0.0, rtol=0.0, atol=1e-12
+    ):
+        raise ValueError(
+            "pin_endpoints=True, but beta_hat has nonzero endpoint coefficients."
+        )
+
+    K_free = K[:, layout.s]
+    w_free = layout.w_free
+    M_free = layout.M_free
 
     if s2_diag is not None:
         s2_diag = np.asarray(s2_diag).reshape(-1)
@@ -717,22 +740,24 @@ def one_step_c(D, K, K_prime, beta_hat, c_hat, w_norm=None, Sigma=None, s2_diag=
     r_hat = D - mu_hat
     mu_prime_hat = K_prime @ beta_hat
 
-    SinvK = Sigma_inv(K)                          # (N, M)
-    U = 2 * K.T @ SinvK                           # (M, M)
-    b = 2 * K.T @ Sigma_inv(mu_prime_hat)         # (M,)
+    SinvK_free = Sigma_inv(K_free)                       # (N, M_free)
+    U = 2 * K_free.T @ SinvK_free                        # (M_free, M_free)
+    b = 2 * K_free.T @ Sigma_inv(mu_prime_hat)           # (M_free,)
 
-    if w_norm is None:
+    if w_free is None:
         # Unconstrained projection: minimize ||mu' - K h||^2_{Sigma^{-1}}
         try:
-            h_star = np.linalg.solve(U, b)
+            h_free = np.linalg.solve(U, b)
         except np.linalg.LinAlgError:
-            h_star = np.linalg.lstsq(U, b, rcond=None)[0]
+            h_free = np.linalg.lstsq(U, b, rcond=None)[0]
         lam = None
     else:
-        # Constrained projection: minimize ||mu' - K h||^2_{Sigma^{-1}} s.t. w^T h = 0
+        # Constrained projection over the free coordinates:
+        # minimize ||mu' - K_free h_free||^2_{Sigma^{-1}}
+        # subject to w_free^T h_free = 0.
         KKT = np.block([
-            [U,                    w_norm[:, None]],
-            [w_norm[None, :],      np.zeros((1, 1))]
+            [U,                    w_free[:, None]],
+            [w_free[None, :],      np.zeros((1, 1))]
         ])
         rhs = np.concatenate([b, np.array([0.0])])
 
@@ -741,9 +766,10 @@ def one_step_c(D, K, K_prime, beta_hat, c_hat, w_norm=None, Sigma=None, s2_diag=
         except np.linalg.LinAlgError:
             sol = np.linalg.lstsq(KKT, rhs, rcond=None)[0]
 
-        h_star = sol[:M]
-        lam = float(sol[M])
+        h_free = sol[:M_free]
+        lam = float(sol[M_free])
 
+    h_star = layout.build_full(h_free)
     delta_hat = mu_prime_hat - K @ h_star
 
     num = float(delta_hat.T @ Sigma_inv(r_hat))
@@ -762,6 +788,9 @@ def one_step_c(D, K, K_prime, beta_hat, c_hat, w_norm=None, Sigma=None, s2_diag=
         "den": den,
         "eif": eif,
         "lambda": lam,
+        "h_star": h_star,
+        "free_beta_indices": np.arange(M)[layout.s],
+        "pin_endpoints": bool(pin_endpoints),
         "w_dot_beta": float(w_norm @ beta_hat) if w_norm is not None else None,
         "w_dot_h": float(w_norm @ h_star) if w_norm is not None else None,
     }
@@ -891,7 +920,8 @@ def bootstrap_confidence_interval(
                 K_b       = build_K_matrix(c_b, A, xQ2, klin=_klin, kquad=_kquad)
                 K_prime_b = build_K_prime_matrix(c_b, A, xQ2, klin=_klin, kquad=_kquad)
                 c_os_b, _ = one_step_c(D_star, K_b, K_prime_b, beta_b, c_b,
-                                       w_norm=w_norm, Sigma=Sigma)
+                                       w_norm=w_norm, Sigma=Sigma,
+                                       pin_endpoints=pin_endpoints)
                 boot_samples[b] = c_os_b
         except Exception as e:
             if verbose:
@@ -1324,7 +1354,7 @@ def setup_experiment(pdf, c, f, xQ2, grid, degree, M, W,
     }
 
 
-def run_single_experiment(setup_dict, diagnostics=False, show_plots=True):
+def run_single_experiment(setup_dict, diagnostics=False, show_plots=True, rng=None):
     """
     Run one experiment: generate data, fit (beta, c), apply one-step correction.
 
@@ -1337,6 +1367,10 @@ def run_single_experiment(setup_dict, diagnostics=False, show_plots=True):
     show_plots : bool
         If True (and diagnostics=True), render diagnostic figures. Set to
         False to get info without displaying any plots.
+    rng : numpy.random.Generator, optional
+        Random-number generator used for the simulated data draw. If omitted,
+        a fresh generator is created. Passing one generator across calls makes
+        a simulation sequence reproducible without repeating the same draw.
 
     Returns
     -------
@@ -1387,23 +1421,29 @@ def run_single_experiment(setup_dict, diagnostics=False, show_plots=True):
     _v_prime_c = lambda c, xQ2: v_prime_c(c, xQ2, klin=_klin, kquad=_kquad)
 
     # Generate data
+    if rng is None:
+        rng = np.random.default_rng()
+    if not isinstance(rng, np.random.Generator):
+        raise TypeError("rng must be a numpy.random.Generator or None.")
+
     if data_Sigma is not None:
-        rng = np.random.default_rng(seed=None)
         D = rng.multivariate_normal(mean=mu, cov=data_Sigma)
     else:
-        D = mu + np.sqrt(data_var) * np.random.randn(len(mu))
+        D = mu + np.sqrt(data_var) * rng.standard_normal(len(mu))
         data_Sigma = np.eye(len(mu)) * data_var
 
     # MLE fitting
     if opt == "joint":
         if return_history:
             res, history = fit_beta_c(D, A, _v_c, _v_prime_c, fit_w_norm, xQ2,
-                                      Sigma=data_Sigma, nonneg_beta=nonneg_beta,
+                                      Sigma=data_Sigma, beta0=beta0, c0=c0,
+                                      nonneg_beta=nonneg_beta,
                                       pin_endpoints=pin_endpoints, opt_method=beta_opt,
                                       return_history=True, loss_scale=loss_scale)
         else:
             res = fit_beta_c(D, A, _v_c, _v_prime_c, fit_w_norm, xQ2,
-                             Sigma=data_Sigma, nonneg_beta=nonneg_beta,
+                             Sigma=data_Sigma, beta0=beta0, c0=c0,
+                             nonneg_beta=nonneg_beta,
                              pin_endpoints=pin_endpoints, opt_method=beta_opt,
                              return_history=False, loss_scale=loss_scale)
         beta_hat = res.beta_hat
@@ -1411,13 +1451,13 @@ def run_single_experiment(setup_dict, diagnostics=False, show_plots=True):
     elif opt == "separate":
         if return_history:
             beta_hat, history = mle_beta(D=D, A=A, c=c0, v=_v_c, xQ2=xQ2,
-                                         Sigma=data_Sigma, w_norm=fit_w_norm, beta0=None,
+                                         Sigma=data_Sigma, w_norm=fit_w_norm, beta0=beta0,
                                          nonneg_beta=nonneg_beta, pin_endpoints=pin_endpoints,
                                          beta_opt=beta_opt, return_history=True,
                                          loss_scale=loss_scale)
         else:
             beta_hat = mle_beta(D=D, A=A, c=c0, v=_v_c, xQ2=xQ2,
-                                Sigma=data_Sigma, w_norm=fit_w_norm, beta0=None,
+                                Sigma=data_Sigma, w_norm=fit_w_norm, beta0=beta0,
                                 nonneg_beta=nonneg_beta, pin_endpoints=pin_endpoints,
                                 beta_opt=beta_opt, return_history=False,
                                 loss_scale=loss_scale)
@@ -1433,7 +1473,8 @@ def run_single_experiment(setup_dict, diagnostics=False, show_plots=True):
     K       = build_K_matrix(c_hat, A, xQ2, klin=_klin, kquad=_kquad)
     K_prime = build_K_prime_matrix(c_hat, A, xQ2, klin=_klin, kquad=_kquad)
     c_one_step, one_step_info = one_step_c(D, K, K_prime, beta_hat, c_hat,
-                                           one_step_w_norm, Sigma=data_Sigma)
+                                           one_step_w_norm, Sigma=data_Sigma,
+                                           pin_endpoints=pin_endpoints)
     mu_one_step = true_mean_basis(c_one_step, beta_hat, A, xQ2,
                                   klin=_klin, kquad=_kquad)
 
@@ -1525,7 +1566,8 @@ def experiment(c, f, xQ2, grid, W, degree, M,
                klin_fn=None, kquad_fn=None,
                nonneg_beta=True, diagnostics=False, ncol_plots=4,
                x_log_scale=True, parametrize="f", return_history=False,
-               mle_constrained=True, one_step_constrained=True):
+               mle_constrained=True, one_step_constrained=True,
+               pin_endpoints=False):
     """
     Convenience wrapper: runs setup_experiment() then run_single_experiment().
 
@@ -1546,7 +1588,8 @@ def experiment(c, f, xQ2, grid, W, degree, M,
         Lambda=Lambda, x_min=x_min, x_max=x_max,
         Q2_min=Q2_min, Q2_max=Q2_max,
         klin_fn=klin_fn, kquad_fn=kquad_fn,
-        nonneg_beta=nonneg_beta, ncol_plots=ncol_plots,
+        nonneg_beta=nonneg_beta, pin_endpoints=pin_endpoints,
+        ncol_plots=ncol_plots,
         x_log_scale=x_log_scale, parametrize=parametrize,
         mle_constrained=mle_constrained,
         one_step_constrained=one_step_constrained,
