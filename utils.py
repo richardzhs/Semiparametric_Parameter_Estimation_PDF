@@ -1,10 +1,10 @@
 """
-T3_utils.py — Utility functions for the T3 demo.
+utils.py — Utility functions for the demos.
 
 Sections
 --------
 1. Basis Functions
-2. Wilson Coefficients & Model
+2. Wilson Coefficients & EFT
 3. Design Matrices & Theory Predictions
 4. Likelihood & Fitting
 5. Plotting
@@ -57,6 +57,10 @@ def bspline_basis(degree, M, a, b):
     return B
 
 
+# =============================================================================
+# 2. Wilson Coefficients & EFT
+# =============================================================================
+
 def _as_pairs(xQ2):
     """
     Normalize input into an (n, 2) float array of (x, Q2) pairs.
@@ -82,11 +86,6 @@ def _validate_x(x, idx=None):
     if x <= 0.0:
         where = f" at index {idx}" if idx is not None else ""
         raise ValueError(f"x must be in (0,1], got x={x}{where}.")
-
-
-# =============================================================================
-# 2. Wilson Coefficients & Model
-# =============================================================================
 
 def klin(z, Lambda=100):
     """Linear Wilson coefficient: Q^2 / Lambda^2."""
@@ -219,12 +218,23 @@ def true_mean(c, T, xQ2, klin=klin, kquad=kquad):
     return v * T
 
 
-def true_mean_basis(c, beta, A, xQ2, klin=klin, kquad=kquad):
+def true_mean_basis(c, beta, A, xQ2, klin=klin, kquad=kquad,
+                    target_offset=None):
     """
-    Full mean mu = v_c(c, xQ2) * (A @ beta).
+    Full mean mu = v_c(c, xQ2) * (A @ beta + target_offset).
+
+    ``target_offset`` is a fixed contribution inside the EFT factor.  
+    Unlike an ordinary additive background, it is multiplied by the EFT factor.
     """
     v = v_c(c, xQ2, klin=klin, kquad=kquad)
     T = T_sm_basis(A, beta)
+    if target_offset is not None:
+        target_offset = np.asarray(target_offset, dtype=float).reshape(-1)
+        if target_offset.shape != T.shape:
+            raise ValueError(
+                f"target_offset must have shape {T.shape}, got {target_offset.shape}."
+            )
+        T = T + target_offset
     return v * T
 
 
@@ -232,7 +242,8 @@ def true_mean_basis(c, beta, A, xQ2, klin=klin, kquad=kquad):
 # 4. Likelihood & Fitting
 # =============================================================================
 
-def make_nll_and_grad(D, A, v, v_prime, xQ2, Sigma=None):
+def make_nll_and_grad(D, A, v, v_prime, xQ2, Sigma=None,
+                      target_offset=None):
     """
     Build the negative log-likelihood and its gradient as callables.
 
@@ -251,6 +262,14 @@ def make_nll_and_grad(D, A, v, v_prime, xQ2, Sigma=None):
     grad : callable(theta) -> (M+1,) gradient array
     """
     N, M = A.shape
+    if target_offset is None:
+        target_offset = np.zeros(N)
+    else:
+        target_offset = np.asarray(target_offset, dtype=float).reshape(-1)
+        if target_offset.shape != (N,):
+            raise ValueError(
+                f"target_offset must have shape {(N,)}, got {target_offset.shape}."
+            )
 
     if Sigma is not None:
         cF, lower = cho_factor(Sigma, check_finite=False)
@@ -264,7 +283,8 @@ def make_nll_and_grad(D, A, v, v_prime, xQ2, Sigma=None):
         beta = theta[:M]
         c = theta[-1]
         vc = v(c, xQ2=xQ2)
-        mu = vc * (A @ beta)
+        target = A @ beta + target_offset
+        mu = vc * target
         r = D - mu
         return 0.5 * r @ Sigma_inv(r)
 
@@ -273,11 +293,12 @@ def make_nll_and_grad(D, A, v, v_prime, xQ2, Sigma=None):
         c = theta[-1]
         vc = v(c, xQ2=xQ2)
         dv = v_prime(c, xQ2=xQ2)
-        mu = vc * (A @ beta)
+        target = A @ beta + target_offset
+        mu = vc * target
         r = D - mu
         Sigma_inv_r = Sigma_inv(r)
         g_beta = -((vc[:, None] * A).T @ Sigma_inv_r)
-        g_c = -(dv * (A @ beta)).T @ Sigma_inv_r
+        g_c = -(dv * target).T @ Sigma_inv_r
         return np.r_[g_beta, g_c]
 
     return nll, grad
@@ -352,9 +373,9 @@ def _run_with_restarts(minimize_fn, theta0, gen_theta, num_try, history=None):
     return res
 
 
-def fit_beta_c(D, A, v, v_prime, w_norm=None, xQ2=None, Sigma=None, beta0=None, c0=0.0,
-               nonneg_beta=False, pin_endpoints=False, return_history=False,
-               opt_method="SLSQP", loss_scale=1, num_try=10):
+def fit_beta_c(D, A, v, v_prime, w_norm=None, xQ2=None, Sigma=None, target_offset=None,
+               beta0=None, c0=0.0, nonneg_beta=False, pin_endpoints=False, 
+               return_history=False, opt_method="SLSQP", loss_scale=1, num_try=10):
     """
     Joint MLE of (beta, c) via constrained minimization of the negative log-likelihood.
 
@@ -368,6 +389,7 @@ def fit_beta_c(D, A, v, v_prime, w_norm=None, xQ2=None, Sigma=None, beta0=None, 
         unconstrained optimization.
     xQ2 : (N, 2) array of (x, Q^2) pairs.
     Sigma : (N, N) covariance, or None for identity.
+    target_offset : (N,) fixed contribution inside the EFT factor, or None.
     beta0 : (M,) initial beta, or None for random initialization.
     c0 : float, initial c.
     nonneg_beta : bool, enforce beta >= 0.
@@ -389,7 +411,10 @@ def fit_beta_c(D, A, v, v_prime, w_norm=None, xQ2=None, Sigma=None, beta0=None, 
     beta0_free = layout.init_free(beta0, nonneg_beta, pin_endpoints)
     theta0 = np.r_[beta0_free, c0]
 
-    nll, grad = make_nll_and_grad(D, A, v, v_prime, xQ2=xQ2, Sigma=Sigma)
+    nll, grad = make_nll_and_grad(
+        D, A, v, v_prime, xQ2=xQ2, Sigma=Sigma,
+        target_offset=target_offset,
+    )
 
     def unpack_theta(theta):
         beta_free = theta[:M_free]
@@ -466,8 +491,9 @@ def fit_beta_c(D, A, v, v_prime, w_norm=None, xQ2=None, Sigma=None, beta0=None, 
     return res
 
 
-def mle_beta(D, A, c, v, xQ2, w_norm=None, Sigma=None, beta0=None, nonneg_beta=True,
-             pin_endpoints=False, beta_opt="SLSQP", return_history=False, loss_scale=1, num_try=10):
+def mle_beta(D, A, c, v, xQ2, w_norm=None, Sigma=None, target_offset=None, 
+             beta0=None, nonneg_beta=True, pin_endpoints=False, beta_opt="SLSQP", 
+             return_history=False, loss_scale=1, num_try=10):
     """
     MLE of beta given a fixed c.
 
@@ -481,6 +507,7 @@ def mle_beta(D, A, c, v, xQ2, w_norm=None, Sigma=None, beta0=None, nonneg_beta=T
     w_norm : (M,) normalization weights enforcing w_norm @ beta = 1, or None for
         unconstrained optimization.
     Sigma : (N, N) covariance, or None for identity.
+    target_offset : (N,) fixed contribution inside the EFT factor, or None.
     beta0 : (M,) initial guess, or None for random initialization.
     nonneg_beta : bool, enforce beta >= 0.
     pin_endpoints : bool, fix beta[0] = beta[-1] = 0.
@@ -495,6 +522,14 @@ def mle_beta(D, A, c, v, xQ2, w_norm=None, Sigma=None, beta0=None, nonneg_beta=T
     history : list of per-iteration dicts (only if return_history=True).
     """
     N, M = A.shape
+    if target_offset is None:
+        target_offset = np.zeros(N)
+    else:
+        target_offset = np.asarray(target_offset, dtype=float).reshape(-1)
+        if target_offset.shape != (N,):
+            raise ValueError(
+                f"target_offset must have shape {(N,)}, got {target_offset.shape}."
+            )
     layout = _BetaLayout(M, w_norm, pin_endpoints)
     M_free, w_free = layout.M_free, layout.w_free
 
@@ -510,7 +545,9 @@ def mle_beta(D, A, c, v, xQ2, w_norm=None, Sigma=None, beta0=None, nonneg_beta=T
 
     if beta_opt in ("SLSQP", "trust-constr"):
         def loss_and_grad(beta_free):
-            r = D - vc * (A @ layout.build_full(beta_free))
+            r = D - vc * (
+                A @ layout.build_full(beta_free) + target_offset
+            )
             Sinv_r = Sigma_inv(r)
             f = 0.5 * r @ Sinv_r
             g = -(vcA.T @ Sinv_r)[layout.s]
@@ -582,7 +619,8 @@ def mle_beta(D, A, c, v, xQ2, w_norm=None, Sigma=None, beta0=None, nonneg_beta=T
             [Sigma_inv(Wmat_free[:, j]) for j in range(M_free)]
         )
         U = Wmat_free.T @ SinvW                                      # (M_free, M_free)
-        b = Wmat_free.T @ Sigma_inv(D)                               # (M_free,)
+        D_adjusted = D - vc * target_offset
+        b = Wmat_free.T @ Sigma_inv(D_adjusted)                      # (M_free,)
 
         if w_free is not None:
             KKT = np.zeros((M_free + 1, M_free + 1), dtype=float)
@@ -607,7 +645,8 @@ def mle_beta(D, A, c, v, xQ2, w_norm=None, Sigma=None, beta0=None, nonneg_beta=T
 
 
 
-def mle_c(D, A, v, beta, xQ2, Sigma=None, c_opt="scipy_optimize", c_range=(-5.0, 5.0)):
+def mle_c(D, A, v, beta, xQ2, Sigma=None, target_offset=None, 
+          c_opt="scipy_optimize", c_range=(-5.0, 5.0)):
     """
     MLE of c given a fixed beta.
 
@@ -619,6 +658,7 @@ def mle_c(D, A, v, beta, xQ2, Sigma=None, c_opt="scipy_optimize", c_range=(-5.0,
     beta : (M,) fixed coefficient vector.
     xQ2 : (N, 2) array of (x, Q^2) pairs.
     Sigma : (N, N) covariance, or None for identity.
+    target_offset : (N,) fixed contribution inside the EFT factor, or None.
     c_opt : "scipy_optimize" or "grid_search".
     c_range: tuple (c_min, c_max) for grid search, default (-5.0, 5.0).
 
@@ -626,6 +666,16 @@ def mle_c(D, A, v, beta, xQ2, Sigma=None, c_opt="scipy_optimize", c_range=(-5.0,
     -------
     c_hat : float
     """
+
+    N = A.shape[0]
+    if target_offset is None:
+        target_offset = np.zeros(N)
+    else:
+        target_offset = np.asarray(target_offset, dtype=float).reshape(-1)
+        if target_offset.shape != (N,):
+            raise ValueError(
+                f"target_offset must have shape {(N,)}, got {target_offset.shape}."
+            )
 
     if Sigma is not None:
         cF, lower = cho_factor(Sigma, check_finite=False)
@@ -635,7 +685,7 @@ def mle_c(D, A, v, beta, xQ2, Sigma=None, c_opt="scipy_optimize", c_range=(-5.0,
 
     def nll(c):
         vc = v(c, xQ2=xQ2)
-        mu = vc * (A @ beta)
+        mu = vc * (A @ beta + target_offset)
         r = D - mu
         return 0.5 * r @ Sigma_inv(r)
 
@@ -656,7 +706,8 @@ def mle_c(D, A, v, beta, xQ2, Sigma=None, c_opt="scipy_optimize", c_range=(-5.0,
 
 
 def one_step_c(D, K, K_prime, beta_hat, c_hat, w_norm=None, Sigma=None,
-               s2_diag=None, pin_endpoints=False):
+               s2_diag=None, pin_endpoints=False, fixed_mean=None,
+               fixed_mean_prime=None):
     """
     One-step estimator for c using the efficient influence function (EIF).
 
@@ -679,6 +730,10 @@ def one_step_c(D, K, K_prime, beta_hat, c_hat, w_norm=None, Sigma=None,
         If True, beta[0] and beta[-1] are fixed and excluded from the nuisance
         tangent space. The fitted mean and its c derivative still use the full
         coefficient vector.
+    fixed_mean : (N,) fixed target contribution after multiplication by v(c).
+    fixed_mean_prime : (N,) c derivative of ``fixed_mean``. Both default to
+        zero. These terms affect the mean and c score but not the beta nuisance
+        tangent space.
 
     Returns
     -------
@@ -693,6 +748,24 @@ def one_step_c(D, K, K_prime, beta_hat, c_hat, w_norm=None, Sigma=None,
     K_prime = np.asarray(K_prime)
 
     N, M = K.shape
+
+    if fixed_mean is None:
+        fixed_mean = np.zeros(N)
+    else:
+        fixed_mean = np.asarray(fixed_mean, dtype=float).reshape(-1)
+        if fixed_mean.shape != (N,):
+            raise ValueError(
+                f"fixed_mean must have shape {(N,)}, got {fixed_mean.shape}."
+            )
+    if fixed_mean_prime is None:
+        fixed_mean_prime = np.zeros(N)
+    else:
+        fixed_mean_prime = np.asarray(fixed_mean_prime, dtype=float).reshape(-1)
+        if fixed_mean_prime.shape != (N,):
+            raise ValueError(
+                "fixed_mean_prime must have shape "
+                f"{(N,)}, got {fixed_mean_prime.shape}."
+            )
 
     if D.shape[0] != N:
         raise ValueError(f"D has length {D.shape[0]} but K has {N} rows.")
@@ -736,9 +809,9 @@ def one_step_c(D, K, K_prime, beta_hat, c_hat, w_norm=None, Sigma=None,
             def Sigma_inv(v):
                 return cho_solve((cF, lower), v, check_finite=False)
 
-    mu_hat = K @ beta_hat
+    mu_hat = K @ beta_hat + fixed_mean
     r_hat = D - mu_hat
-    mu_prime_hat = K_prime @ beta_hat
+    mu_prime_hat = K_prime @ beta_hat + fixed_mean_prime
 
     SinvK_free = Sigma_inv(K_free)                       # (N, M_free)
     U = 2 * K_free.T @ SinvK_free                        # (M_free, M_free)
@@ -823,6 +896,7 @@ def bootstrap_confidence_interval(
     A, xQ2, Sigma,
     c_hat, beta_hat,
     w_norm=None,
+    target_offset=None,
     c0=0, n_boot=500,
     alpha=0.05,
     ci_method="normal",
@@ -841,8 +915,9 @@ def bootstrap_confidence_interval(
     """
     Parametric bootstrap CI for c (plug-in MLE or one-step estimator).
 
-    Resamples D* ~ N(mu_hat, Sigma) where mu_hat = v_c(c_hat) * A @ beta_hat,
-    refits the model on each replicate, and returns a percentile CI.
+    Resamples D* ~ N(mu_hat, Sigma), where
+    mu_hat = v_c(c_hat) * (A @ beta_hat + target_offset), refits the model on
+    each replicate, and returns a confidence interval.
 
     Parameters
     ----------
@@ -853,6 +928,7 @@ def bootstrap_confidence_interval(
     beta_hat : (M,) plug-in MLE of beta from the original fit.
     w_norm : (M,) normalization weights for the sum-rule constraint, or None
         to skip the constraint (default None).
+    target_offset : (N,) fixed contribution inside the EFT factor, or None.
     c0 : float, initial guess for c in each bootstrap fit (default 0).
     n_boot : int, number of bootstrap replicates (default 500).
     alpha : float, significance level (default 0.05 for 95% CI).
@@ -885,7 +961,20 @@ def bootstrap_confidence_interval(
     _v_c       = lambda c, xQ2: v_c(c, xQ2, klin=_klin, kquad=_kquad)
     _v_prime_c = lambda c, xQ2: v_prime_c(c, xQ2, klin=_klin, kquad=_kquad)
 
-    mu_hat = true_mean_basis(c_hat, beta_hat, A, xQ2, klin=_klin, kquad=_kquad)
+    if target_offset is None:
+        target_offset = np.zeros(A.shape[0])
+    else:
+        target_offset = np.asarray(target_offset, dtype=float).reshape(-1)
+        if target_offset.shape != (A.shape[0],):
+            raise ValueError(
+                "target_offset must have shape "
+                f"{(A.shape[0],)}, got {target_offset.shape}."
+            )
+
+    mu_hat = true_mean_basis(
+        c_hat, beta_hat, A, xQ2, klin=_klin, kquad=_kquad,
+        target_offset=target_offset,
+    )
     rng = np.random.default_rng(seed)
     boot_samples = np.full(n_boot, np.nan)
 
@@ -903,25 +992,32 @@ def bootstrap_confidence_interval(
                 res = fit_beta_c(D_star, A, _v_c, _v_prime_c, c0=c0, w_norm=w_norm, xQ2=xQ2,
                                  Sigma=Sigma, nonneg_beta=nonneg_beta, 
                                  pin_endpoints=pin_endpoints, opt_method=beta_opt,
-                                 return_history=False, loss_scale=loss_scale)
+                                 return_history=False, loss_scale=loss_scale,
+                                 target_offset=target_offset)
                 beta_b, c_b = res.beta_hat, res.c_hat
             else:  # separate
                 beta_b = mle_beta(D=D_star, A=A, c=c0, v=_v_c, xQ2=xQ2,
                                   Sigma=Sigma, w_norm=w_norm,
                                   nonneg_beta=nonneg_beta, pin_endpoints=pin_endpoints,
                                   beta_opt=beta_opt, return_history=False,
-                                  loss_scale=loss_scale)
+                                  loss_scale=loss_scale,
+                                  target_offset=target_offset)
                 c_b = mle_c(D=D_star, A=A, v=_v_c, beta=beta_b, xQ2=xQ2,
-                            Sigma=Sigma, c_opt=c_opt, c_range=c_range)
+                            Sigma=Sigma, c_opt=c_opt, c_range=c_range,
+                            target_offset=target_offset)
 
             if estimator == "mle":
                 boot_samples[b] = c_b
             else:
                 K_b       = build_K_matrix(c_b, A, xQ2, klin=_klin, kquad=_kquad)
                 K_prime_b = build_K_prime_matrix(c_b, A, xQ2, klin=_klin, kquad=_kquad)
+                fixed_mean_b = _v_c(c_b, xQ2) * target_offset
+                fixed_mean_prime_b = _v_prime_c(c_b, xQ2) * target_offset
                 c_os_b, _ = one_step_c(D_star, K_b, K_prime_b, beta_b, c_b,
                                        w_norm=w_norm, Sigma=Sigma,
-                                       pin_endpoints=pin_endpoints)
+                                       pin_endpoints=pin_endpoints,
+                                       fixed_mean=fixed_mean_b,
+                                       fixed_mean_prime=fixed_mean_prime_b)
                 boot_samples[b] = c_os_b
         except Exception as e:
             if verbose:
