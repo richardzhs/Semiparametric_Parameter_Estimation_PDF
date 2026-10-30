@@ -1,9 +1,13 @@
 # Reproducing the paper results
 
-- [BCDMS demo](BCDMS_demo.ipynb)
-- [HERA demo](HERA_demo.ipynb)
+There are two ways in, depending on how much control you want.
 
-Each notebook displays the saved simulation results used in the paper. Run all cells to regenerate the summary tables and plots from the included archives. New fits and simulations are optional and disabled by default.
+| | Notebooks | Use these to |
+|---|---|---|
+| **Demos** | [BCDMS demo](BCDMS_demo.ipynb), [HERA demo](HERA_demo.ipynb) | Reproduce the paper's tables and plots from the saved archives. No extra setup and nothing to configure. |
+| **Experiments** | [BCDMS experiment](BCDMS_experiment.ipynb), [HERA experiment](HERA_experiment.ipynb) | Control the basis, design matrix, fitting method, and simulation settings, and rerun the study end to end. |
+
+Start with a demo if you want the published numbers. Each demo notebook displays the saved simulation results used in the paper: run all cells to regenerate the summary tables and plots from the included archives. New fits and simulations are optional and disabled by default.
 
 ## Environment and execution
 
@@ -13,7 +17,9 @@ Use Python 3.11 and install the tested dependencies:
 python -m pip install -r requirements-paper-demos.txt
 ```
 
-Open either notebook in a Jupyter-compatible editor, select that Python environment, and run all cells from the repository directory. If using JupyterLab, install it separately. Keep `paper_demo_utils.py` and `paper_results/` alongside the notebooks. LHAPDF is not required to read the results or refit the saved design matrices.
+Open a notebook in a Jupyter-compatible editor, select that Python environment, and run all cells from the repository directory. If using JupyterLab, install it separately. Keep `paper_demo_utils.py` and `paper_results/` alongside the notebooks. LHAPDF is not required to read the results or refit the saved design matrices.
+
+That covers the demos completely. The experiment notebooks need one addition: LHAPDF with the `NNPDF40_nnlo_as_01180` set, which `requirements-paper-demos.txt` does not install. Reading them needs nothing extra.
 
 ## Reading the results
 
@@ -49,12 +55,9 @@ This workflow reproduces the inference stage from the saved model. Library versi
 
 ## Experiment notebooks
 
-- [BCDMS experiment](BCDMS_experiment.ipynb)
-- [HERA experiment](HERA_experiment.ipynb)
+[BCDMS experiment](BCDMS_experiment.ipynb) and [HERA experiment](HERA_experiment.ipynb) are the full research notebooks behind the two demos, covering basis construction, design-matrix assembly, fitting, and the simulation studies. Where a demo replays the saved results, these expose the settings that produced them and let you change any of them.
 
-These are the full research notebooks behind the two demos, covering basis construction, design-matrix assembly, fitting, and the simulation studies. They read the archives in `paper_results/` together with the design-matrix inputs in `Dataset/`, and they retain their tables and plots for reading without execution.
-
-Running them requires more than the demos: LHAPDF with the `NNPDF40_nnlo_as_01180` set, which `requirements-paper-demos.txt` does not install. Reading them needs nothing extra. When their simulation cells are enabled, new output is written under `simulation_results/` and the archived results are left untouched.
+They read the archives in `paper_results/` together with the design-matrix inputs in `Dataset/`, and they retain their tables and plots for reading without execution. When their simulation cells are enabled, new output is written under `simulation_results/` and the archived results are left untouched.
 
 ## Required files
 
