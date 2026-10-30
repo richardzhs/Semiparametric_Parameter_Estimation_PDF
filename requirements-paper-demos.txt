@@ -1,0 +1,8 @@
+# Versions used to execute and validate the paper-result notebooks (Python 3.11).
+numpy==2.2.6
+pandas==2.3.3
+scipy==1.17.1
+matplotlib==3.10.8
+ipykernel==7.2.0
+nbformat==5.10.4
+nbclient==0.10.4

@@ -1,0 +1,14 @@
+{
+  "T3": {
+    "source": "simulation_results/BCDMS/T3_simulation_results_c=500_Lambda=500.npz",
+    "snapshot": "paper_results/T3_simulation_results_c=500_Lambda=500.npz",
+    "sha256": "62cfc3b67a1180999cf3389eedab66454af084d6b734b4268f07227279a48942",
+    "source_notebook_sha256": "5e8088d14fdd86783d0816b3e294edf8fd02b78e1669729167057bfbc73809ad"
+  },
+  "V": {
+    "source": "simulation_results/HERA/V_simulation_results_c=2_Lambda=500.npz",
+    "snapshot": "paper_results/V_simulation_results_c=2_Lambda=500.npz",
+    "sha256": "648f88f71fc09f8f6a5aa7353be1332c91862b6b643c832799f73bd986c5d8dc",
+    "source_notebook_sha256": "4edded79d989f5dc32137bdde9245d89cda323720512223578259e14914a6acd"
+  }
+}
