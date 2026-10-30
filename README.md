@@ -47,6 +47,15 @@ Nested bootstrap runs can take a long time. New results remain separate from the
 
 This workflow reproduces the inference stage from the saved model. Library versions, optimizer initialization, and historical random-number handling can prevent exact numerical reproduction. In particular, the historical HERA bootstrap calls did not set a seed; new bootstrap draws are seeded. Use the checked archives to recover the exact saved results.
 
+## Experiment notebooks
+
+- [BCDMS experiment](BCDMS_experiment.ipynb)
+- [HERA experiment](HERA_experiment.ipynb)
+
+These are the full research notebooks behind the two demos, covering basis construction, design-matrix assembly, fitting, and the simulation studies. They read the archives in `paper_results/` together with the design-matrix inputs in `Dataset/`, and they retain their tables and plots for reading without execution.
+
+Running them requires more than the demos: LHAPDF with the `NNPDF40_nnlo_as_01180` set, which `requirements-paper-demos.txt` does not install. Reading them needs nothing extra. When their simulation cells are enabled, new output is written under `simulation_results/` and the archived results are left untouched.
+
 ## Required files
 
-Keep the two demo notebooks, `paper_demo_utils.py`, `requirements-paper-demos.txt`, and the contents of `paper_results/` together. Optional refitting also requires the repository's `utils.py`. The notebooks retain their tables and plots for reading without execution.
+Keep the two demo notebooks, `paper_demo_utils.py`, `requirements-paper-demos.txt`, and the contents of `paper_results/` together. Optional refitting also requires the repository's `utils.py`. The notebooks retain their tables and plots for reading without execution. The experiment notebooks additionally need `Dataset/data_208.npz` and `Dataset/data_HERA_F3_aZ_PID200.npz`.
