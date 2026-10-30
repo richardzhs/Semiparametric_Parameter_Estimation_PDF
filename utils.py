@@ -16,6 +16,7 @@ from functools import partial
 import numpy as np
 from scipy.interpolate import BSpline
 from scipy.integrate import quad, fixed_quad
+from scipy.differentiate import hessian as scipy_hessian
 from scipy.linalg import cho_factor, cho_solve
 from scipy.optimize import minimize
 from scipy.stats import norm
@@ -130,6 +131,13 @@ def v_prime_c(c, xQ2, klin=klin, kquad=kquad):
     xQ2 = _as_pairs(xQ2)
     Q2 = xQ2[:, 1]
     return klin(Q2) + 2.0 * c * kquad(Q2)
+
+
+def v_second_c(c, xQ2, kquad=kquad):
+    """Second derivative of ``v(c; Q^2)`` with respect to ``c``."""
+    xQ2 = _as_pairs(xQ2)
+    Q2 = xQ2[:, 1]
+    return 2.0 * kquad(Q2)
 
 
 # =============================================================================
@@ -892,6 +900,367 @@ def one_step_confidence_interval(c_one_step_info, alpha=0.05):
     ci_upper = c_one_step + z * se
     return ci_lower, ci_upper, se
 
+
+def joint_mle_numerical_hessian(
+    A, xQ2, Sigma, c_hat, beta_hat, v, D,
+    w_norm=None, eft_offset=None, pin_endpoints=False,
+    initial_step=1e-2, order=8, maxiter=10,
+):
+    """Numerically evaluate the reduced joint NLL Hessian at the MLE.
+
+    The parameter order is ``theta = (c, gamma)``, where ``gamma`` spans the
+    allowed tangent directions of the PDF coefficients. Differentiation is
+    performed in scaled local coordinates and transformed back to the
+    original ``(c, gamma)`` coordinates before returning the Hessian.
+
+    Returns
+    -------
+    numerical_hessian, info
+        The Hessian and finite-difference diagnostics, including the tangent
+        basis, parameter scales, estimated errors, and convergence statuses.
+    """
+    A = np.asarray(A, dtype=float)
+    xQ2 = np.asarray(xQ2, dtype=float)
+    Sigma = np.asarray(Sigma, dtype=float)
+    beta_hat = np.asarray(beta_hat, dtype=float).reshape(-1)
+    D = np.asarray(D, dtype=float).reshape(-1)
+
+    if A.ndim != 2:
+        raise ValueError(f"A must be a matrix, got shape {A.shape}.")
+    N, M = A.shape
+    if xQ2.shape != (N, 2):
+        raise ValueError(f"xQ2 must have shape {(N, 2)}, got {xQ2.shape}.")
+    if Sigma.shape != (N, N):
+        raise ValueError(f"Sigma must have shape {(N, N)}, got {Sigma.shape}.")
+    if beta_hat.shape != (M,):
+        raise ValueError(f"beta_hat must have shape {(M,)}, got {beta_hat.shape}.")
+    if D.shape != (N,):
+        raise ValueError(f"D must have shape {(N,)}, got {D.shape}.")
+
+    if w_norm is not None:
+        w_norm = np.asarray(w_norm, dtype=float).reshape(-1)
+        if w_norm.shape != (M,):
+            raise ValueError(f"w_norm must have shape {(M,)}, got {w_norm.shape}.")
+
+    if eft_offset is None:
+        eft_offset = np.zeros(N)
+    else:
+        eft_offset = np.asarray(eft_offset, dtype=float).reshape(-1)
+        if eft_offset.shape != (N,):
+            raise ValueError(
+                f"eft_offset must have shape {(N,)}, got {eft_offset.shape}."
+            )
+
+    layout = _BetaLayout(M, w_norm, pin_endpoints)
+    if pin_endpoints and not np.allclose(
+        beta_hat[[0, -1]], 0.0, rtol=0.0, atol=1e-12
+    ):
+        raise ValueError(
+            "pin_endpoints=True, but beta_hat has nonzero endpoint coefficients."
+        )
+
+    if layout.w_free is None:
+        tangent_basis = np.eye(layout.M_free)
+    else:
+        _, _, vh = np.linalg.svd(
+            layout.w_free[None, :], full_matrices=True
+        )
+        tangent_basis = vh[1:].T
+
+    free_beta_indices = np.arange(M)[layout.s]
+    beta_free = beta_hat[layout.s]
+    n_gamma = tangent_basis.shape[1]
+    gamma_scale = max(
+        1.0,
+        float(np.linalg.norm(beta_free)) / np.sqrt(max(layout.M_free, 1)),
+    )
+    parameter_scales = np.r_[
+        max(1.0, abs(float(c_hat))),
+        np.full(n_gamma, gamma_scale),
+    ]
+
+    cF, lower = cho_factor(Sigma, check_finite=False)
+
+    def nll_at_scaled_local_point(z):
+        local_theta = parameter_scales * np.asarray(z, dtype=float)
+        c = float(c_hat) + local_theta[0]
+        gamma = local_theta[1:]
+        beta = beta_hat.copy()
+        beta[layout.s] += tangent_basis @ gamma
+        target = A @ beta + eft_offset
+        mu = np.asarray(v(c, xQ2=xQ2), dtype=float).reshape(-1) * target
+        residual = D - mu
+        Sigma_inv_residual = cho_solve(
+            (cF, lower), residual, check_finite=False
+        )
+        return float(0.5 * residual @ Sigma_inv_residual)
+
+    def vectorized_nll(z):
+        z = np.asarray(z, dtype=float)
+        if z.ndim == 1:
+            return nll_at_scaled_local_point(z)
+        return np.apply_along_axis(nll_at_scaled_local_point, 0, z)
+
+    theta0_scaled = np.zeros(1 + n_gamma)
+    numerical_result = scipy_hessian(
+        vectorized_nll, theta0_scaled,
+        initial_step=initial_step, order=order, maxiter=maxiter,
+    )
+    hessian_scaled = np.asarray(numerical_result.ddf, dtype=float)
+    numerical_hessian = (
+        hessian_scaled
+        / parameter_scales[:, None]
+        / parameter_scales[None, :]
+    )
+    numerical_hessian = 0.5 * (
+        numerical_hessian + numerical_hessian.T
+    )
+    numerical_error = (
+        np.asarray(numerical_result.error, dtype=float)
+        / parameter_scales[:, None]
+        / parameter_scales[None, :]
+    )
+    info = {
+        "parameter_order": ("c", "f_tangent"),
+        "parameter_scales": parameter_scales,
+        "tangent_basis": tangent_basis,
+        "free_beta_indices": free_beta_indices,
+        "success": np.asarray(numerical_result.success).copy(),
+        "status": np.asarray(numerical_result.status).copy(),
+        "error": numerical_error,
+        "nfev": np.asarray(numerical_result.nfev).copy(),
+        "all_elements_converged": bool(np.all(numerical_result.success)),
+        "condition_number": float(np.linalg.cond(numerical_hessian)),
+        "eigenvalues": np.linalg.eigvalsh(numerical_hessian),
+    }
+    return numerical_hessian, info
+
+
+def joint_mle_analytical_hessian(
+    A, xQ2, Sigma, c_hat, beta_hat, v, v_prime, D, v_second,
+    w_norm=None, eft_offset=None, pin_endpoints=False,
+):
+    """Analytically evaluate the reduced joint observed NLL Hessian.
+
+    The parameter order is ``theta = (c, gamma)``, where ``gamma`` represents
+    the allowed PDF-coefficient directions. Pinned endpoints are excluded, and
+    a normalization constraint is incorporated through its tangent space.
+
+    Returns
+    -------
+    analytical_hessian, info
+        The exact observed Hessian and its component blocks and diagnostics.
+    """
+    A = np.asarray(A, dtype=float)
+    xQ2 = np.asarray(xQ2, dtype=float)
+    Sigma = np.asarray(Sigma, dtype=float)
+    beta_hat = np.asarray(beta_hat, dtype=float).reshape(-1)
+
+    if A.ndim != 2:
+        raise ValueError(f"A must be a matrix, got shape {A.shape}.")
+    N, M = A.shape
+    if xQ2.shape != (N, 2):
+        raise ValueError(f"xQ2 must have shape {(N, 2)}, got {xQ2.shape}.")
+    if Sigma.shape != (N, N):
+        raise ValueError(f"Sigma must have shape {(N, N)}, got {Sigma.shape}.")
+    if beta_hat.shape != (M,):
+        raise ValueError(f"beta_hat must have shape {(M,)}, got {beta_hat.shape}.")
+
+    if w_norm is not None:
+        w_norm = np.asarray(w_norm, dtype=float).reshape(-1)
+        if w_norm.shape != (M,):
+            raise ValueError(f"w_norm must have shape {(M,)}, got {w_norm.shape}.")
+
+    if eft_offset is None:
+        eft_offset = np.zeros(N)
+    else:
+        eft_offset = np.asarray(eft_offset, dtype=float).reshape(-1)
+        if eft_offset.shape != (N,):
+            raise ValueError(
+                f"eft_offset must have shape {(N,)}, got {eft_offset.shape}."
+            )
+
+    layout = _BetaLayout(M, w_norm, pin_endpoints)
+    if pin_endpoints and not np.allclose(
+        beta_hat[[0, -1]], 0.0, rtol=0.0, atol=1e-12
+    ):
+        raise ValueError(
+            "pin_endpoints=True, but beta_hat has nonzero endpoint coefficients."
+        )
+
+    vc = np.asarray(v(c_hat, xQ2=xQ2), dtype=float).reshape(-1)
+    dv = np.asarray(v_prime(c_hat, xQ2=xQ2), dtype=float).reshape(-1)
+    if vc.shape != (N,) or dv.shape != (N,):
+        raise ValueError("v and v_prime must each return a vector of length N.")
+
+    target = A @ beta_hat + eft_offset
+    K_free = (vc[:, None] * A)[:, layout.s]
+    mu_prime = dv * target
+
+    # Orthonormal basis for the allowed beta perturbations.
+    if layout.w_free is None:
+        tangent_basis = np.eye(layout.M_free)
+    else:
+        _, _, vh = np.linalg.svd(
+            layout.w_free[None, :], full_matrices=True
+        )
+        tangent_basis = vh[1:].T
+    K_tangent = K_free @ tangent_basis
+
+    # Full Jacobian for theta = (c, gamma), where allowed beta perturbations
+    # are parameterized as h = tangent_basis @ gamma. The first column is the
+    # derivative with respect to c, matching [[H_cc, H_cf], [H_fc, H_ff]].
+    joint_jacobian = np.column_stack([mu_prime, K_tangent])
+    cF, lower = cho_factor(Sigma, check_finite=False)
+    Sigma_inv_jacobian = cho_solve(
+        (cF, lower), joint_jacobian, check_finite=False
+    )
+    expected_fisher_info = joint_jacobian.T @ Sigma_inv_jacobian
+    D = np.asarray(D, dtype=float).reshape(-1)
+    if D.shape != (N,):
+        raise ValueError(f"D must have shape {(N,)}, got {D.shape}.")
+
+    d2v = np.asarray(
+        v_second(c_hat, xQ2=xQ2), dtype=float
+    ).reshape(-1)
+    if d2v.shape != (N,):
+        raise ValueError("v_second must return a vector of length N.")
+
+    mu_hat = vc * target
+    residual = D - mu_hat
+    Sigma_inv_residual = cho_solve(
+        (cF, lower), residual, check_finite=False
+    )
+
+    # Second derivatives of mu with respect to theta=(c, gamma).
+    A_free = A[:, layout.s]
+    A_tangent = A_free @ tangent_basis
+    mu_gamma_c = dv[:, None] * A_tangent
+    mu_cc = d2v * target
+
+    # mu_gamma_gamma=0
+    H_ff = expected_fisher_info[1:, 1:]
+    H_fc = expected_fisher_info[1:, 0] - mu_gamma_c.T @ Sigma_inv_residual
+    H_cf = H_fc[None, :]
+    H_cc = expected_fisher_info[0, 0] - mu_cc @ Sigma_inv_residual
+    observed_hessian = np.block([
+        [np.array([[H_cc]]), H_cf],
+        [H_fc[:, None], H_ff],
+    ])
+    info = {
+        "parameter_order": ("c", "f_tangent"),
+        "H_cc": H_cc,
+        "H_cf": H_cf,
+        "H_fc": H_fc[:, None],
+        "H_ff": H_ff,
+        "residual": residual,
+        "joint_jacobian": joint_jacobian,
+        "tangent_basis": tangent_basis,
+        "free_beta_indices": np.arange(M)[layout.s],
+        "pin_endpoints": bool(pin_endpoints),
+        "w_dot_beta": float(w_norm @ beta_hat) if w_norm is not None else None,
+        "condition_number": float(np.linalg.cond(observed_hessian)),
+        "eigenvalues": np.linalg.eigvalsh(observed_hessian),
+    }
+    return observed_hessian, info
+
+
+def joint_mle_asymptotic_confidence_interval(
+    A, xQ2, Sigma, c_hat, beta_hat, v, v_prime=None, D=None, v_second=None,
+    w_norm=None, eft_offset=None, pin_endpoints=False, alpha=0.05,
+    hessian_method="analytical", numerical_hessian_options=None,
+):
+    """Asymptotic joint-MLE confidence interval using a selected Hessian.
+
+    Parameters
+    ----------
+    hessian_method : {"analytical", "numerical"}
+        How to compute the full observed Hessian of the negative
+        log-likelihood. Both methods use the same reduced parameter order
+        ``theta = (c, gamma)``. ``v_prime`` and ``v_second`` are only required
+        by the analytical method.
+    numerical_hessian_options : dict or None
+        Optional keyword arguments forwarded to
+        ``joint_mle_numerical_hessian`` when ``hessian_method="numerical"``.
+
+    Returns
+    -------
+    ci_lower, ci_upper, se, info
+        The variance of ``c_hat`` is element ``[0, 0]`` of the inverse of the
+        selected observed Hessian.
+    """
+    method_aliases = {
+        "analytic": "analytical",
+        "analytical": "analytical",
+        "numeric": "numerical",
+        "numerical": "numerical",
+    }
+    if not isinstance(hessian_method, str):
+        raise TypeError("hessian_method must be 'analytical' or 'numerical'.")
+    method = method_aliases.get(hessian_method.lower())
+    if method is None:
+        raise ValueError("hessian_method must be 'analytical' or 'numerical'.")
+    if D is None:
+        raise ValueError("D is required to compute the observed Hessian.")
+
+    if method == "analytical":
+        if v_prime is None or v_second is None:
+            raise ValueError(
+                "v_prime and v_second are required for the analytical Hessian."
+            )
+        observed_hessian, hessian_info = joint_mle_analytical_hessian(
+            A=A, xQ2=xQ2, Sigma=Sigma, c_hat=c_hat,
+            beta_hat=beta_hat, v=v, v_prime=v_prime, D=D,
+            v_second=v_second, w_norm=w_norm, eft_offset=eft_offset,
+            pin_endpoints=pin_endpoints,
+        )
+    else:
+        if numerical_hessian_options is None:
+            numerical_hessian_options = {}
+        observed_hessian, hessian_info = joint_mle_numerical_hessian(
+            A=A, xQ2=xQ2, Sigma=Sigma, c_hat=c_hat,
+            beta_hat=beta_hat, v=v, D=D,
+            w_norm=w_norm, eft_offset=eft_offset,
+            pin_endpoints=pin_endpoints,
+            **numerical_hessian_options,
+        )
+    observed_hessian_condition_number = float(
+        np.linalg.cond(observed_hessian)
+    )
+    try:
+        observed_hessian_inverse = np.linalg.inv(observed_hessian)
+    except np.linalg.LinAlgError as error:
+        raise ValueError(
+            f"The {method} joint observed Hessian is singular. The joint "
+            "model may not identify c separately from the PDF."
+        ) from error
+
+    variance_c = float(observed_hessian_inverse[0, 0])
+    if not np.isfinite(variance_c) or variance_c <= 0:
+        raise ValueError(
+            "The top-left element of the inverse observed Hessian is not "
+            f"positive and finite: {variance_c}."
+        )
+
+    se = float(np.sqrt(variance_c))
+    z = norm.ppf(1.0 - alpha / 2.0)
+    ci_lower = float(c_hat - z * se)
+    ci_upper = float(c_hat + z * se)
+    info = dict(hessian_info)
+    info.update({
+        "c_hat": float(c_hat),
+        "se": se,
+        "variance_c": variance_c,
+        "hessian_method": method,
+        "observed_hessian": observed_hessian,
+        "observed_hessian_inverse": observed_hessian_inverse,
+        "observed_hessian_condition_number": observed_hessian_condition_number,
+        "hessian_computation_info": hessian_info,
+    })
+    info[f"{method}_hessian"] = observed_hessian
+    info[f"{method}_hessian_info"] = hessian_info
+    return ci_lower, ci_upper, se, info
+
 def bootstrap_confidence_interval(
     A, xQ2, Sigma,
     c_hat, beta_hat,
@@ -1062,6 +1431,10 @@ def plot_by_Q2(
     pull=None,
     pull_label="Pull",
     pull_legend=False,
+    y_label_first_column_only=False,
+    legend_mode="first_panel",
+    legend_loc="lower center",
+    legend_ncols=None,
 ):
     """
     Plot one or multiple series grouped into Q^2 panels.
@@ -1122,6 +1495,17 @@ def plot_by_Q2(
         Y-axis label for the pull panels (default "Pull").
     pull_legend : bool, optional
         Whether to show a legend in the pull panels (default False).
+    y_label_first_column_only : bool, optional
+        If True, show main- and pull-panel y-axis labels only in the first
+        subplot column. Tick labels are retained in every panel.
+    legend_mode : {"first_panel", "figure"}, optional
+        Place the main-series legend in the first panel (default) or as one
+        figure-level legend below all panels.
+    legend_loc : str, optional
+        Matplotlib location for the figure-level legend.
+    legend_ncols : int, optional
+        Number of columns in the figure-level legend. Defaults to one column
+        per plotted series.
     """
     xQ2 = np.asarray(xQ2, dtype=float)
     if xQ2.ndim != 2 or xQ2.shape[1] != 2:
@@ -1150,6 +1534,8 @@ def plot_by_Q2(
         series_styles = {}
     if default_style is None:
         default_style = dict(kind="line", linewidth=2)
+    if legend_mode not in ("first_panel", "figure"):
+        raise ValueError("legend_mode must be 'first_panel' or 'figure'.")
 
     Q2_key = np.round(Q2, q2_round_decimals)
     uniq_keys = np.unique(Q2_key)
@@ -1262,10 +1648,11 @@ def plot_by_Q2(
                 ax.plot(x_i, y_i, label=lab, **style)
 
         ax.set_title(r"$Q^2 = {:.6g}$".format(q2_val), fontsize=title_fontsize)
-        ax.set_ylabel(y_label, fontsize=label_fontsize)
+        if not y_label_first_column_only or i % ncols == 0:
+            ax.set_ylabel(y_label, fontsize=label_fontsize)
         ax.grid(True)
 
-        if show_legend and i == 0:
+        if show_legend and legend_mode == "first_panel" and i == 0:
             ax.legend(fontsize=legend_fontsize)
 
         # Pull panel
@@ -1277,7 +1664,8 @@ def plot_by_Q2(
                 kw.update(ps["scatter_kw"])
                 pax.scatter(x_i, pull_vals, label=ps["label"], **kw)
             pax.axhline(0, color="black", linewidth=0.8, linestyle="--")
-            pax.set_ylabel(pull_label, fontsize=label_fontsize)
+            if not y_label_first_column_only or i % ncols == 0:
+                pax.set_ylabel(pull_label, fontsize=label_fontsize)
             pax.grid(True)
             if x_log_scale:
                 pax.set_xscale("log")
@@ -1306,8 +1694,24 @@ def plot_by_Q2(
     if pull_specs is not None:
         for ax in axes[:n_Q2]:
             ax.tick_params(bottom=False, labelbottom=False)
+
+    if show_legend and legend_mode == "figure" and n_Q2:
+        handles, labels = axes[0].get_legend_handles_labels()
+        unique = dict(zip(labels, handles))
+        fig.legend(
+            unique.values(), unique.keys(),
+            loc=legend_loc,
+            bbox_to_anchor=(0.5, 0.01),
+            ncol=legend_ncols or max(1, len(unique)),
+            fontsize=legend_fontsize,
+        )
+
+    if pull_specs is not None:
+        if show_legend and legend_mode == "figure":
+            fig.subplots_adjust(bottom=0.12)
     else:
-        plt.tight_layout()
+        rect = (0, 0.10, 1, 1) if show_legend and legend_mode == "figure" else None
+        fig.tight_layout(rect=rect)
 
     return fig
 
@@ -1326,7 +1730,9 @@ def setup_experiment(pdf, c, f, xQ2, grid, degree, M, W,
                      nonneg_beta=True, pin_endpoints=False, ncol_plots=4,
                      x_log_scale=True, parametrize="f",
                      return_history=False, loss_scale=1, mle_constrained=True,
-                     one_step_constrained=True):
+                     one_step_constrained=True, precomputed=None,
+                     eft_offset=None, fit_validator=None,
+                     one_step_diagonal_covariance=False):
     """
     One-time setup for a simulation experiment.
 
@@ -1405,6 +1811,15 @@ def setup_experiment(pdf, c, f, xQ2, grid, degree, M, W,
         direction h onto the tangent space {h : w_norm @ h = 0}.  If False,
         the one-step correction is unconstrained (w_norm=None is passed to
         one_step_c). Independent of `mle_constrained`.
+    precomputed : dict, optional
+        Precomputed specialized-model components. It must contain ``A``,
+        ``B``, ``w_norm``, ``T``, and ``mu``.
+    eft_offset : (N,) array, optional
+        Fixed contribution inside the EFT factor, included in every fit.
+    fit_validator : callable, optional
+        Called as ``fit_validator(beta_hat)`` after each fit.
+    one_step_diagonal_covariance : bool
+        If True, use only ``diag(data_Sigma)`` for the one-step calculation.
 
     Returns
     -------
@@ -1421,17 +1836,55 @@ def setup_experiment(pdf, c, f, xQ2, grid, degree, M, W,
     if not callable(klin_local) or not callable(kquad_local):
         raise TypeError("klin_fn and kquad_fn must be callable or None.")
 
-    T = T_sm_FK(f=f, W=W, grid=grid)
-    mu = true_mean(c=c, T=T, xQ2=xQ2, klin=klin_local, kquad=kquad_local)
+    if precomputed is None:
+        T = T_sm_FK(f=f, W=W, grid=grid)
+        mu = true_mean(c=c, T=T, xQ2=xQ2, klin=klin_local, kquad=kquad_local)
 
-    B = bspline_basis(degree, M, x_min, x_max)
+        B = bspline_basis(degree, M, x_min, x_max)
 
-    if parametrize == "f":
-        w_norm = np.array([Bk.integrate(x_min, x_max) for Bk in B])
-        A = build_f_design_matrix_FK(B=B, W=W, grid=grid)
-    else:  # "xf"
-        w_norm = np.array([quad(lambda y, Bk=Bk: Bk(y) / y, x_min, x_max)[0] for Bk in B])
-        A = build_yf_design_matrix_FK(B=B, W=W, grid=grid)
+        if parametrize == "f":
+            w_norm = np.array([Bk.integrate(x_min, x_max) for Bk in B])
+            A = build_f_design_matrix_FK(B=B, W=W, grid=grid)
+        else:  # "xf"
+            w_norm = np.array([quad(lambda y, Bk=Bk: Bk(y) / y, x_min, x_max)[0] for Bk in B])
+            A = build_yf_design_matrix_FK(B=B, W=W, grid=grid)
+    else:
+        required = {"A", "B", "w_norm", "T", "mu"}
+        missing = required.difference(precomputed)
+        if missing:
+            raise ValueError(
+                "precomputed is missing required entries: "
+                + ", ".join(sorted(missing))
+            )
+        A = np.asarray(precomputed["A"], dtype=float)
+        B = precomputed["B"]
+        w_norm = precomputed["w_norm"]
+        if w_norm is not None:
+            w_norm = np.asarray(w_norm, dtype=float)
+        T = np.asarray(precomputed["T"], dtype=float)
+        mu = np.asarray(precomputed["mu"], dtype=float)
+        expected_n = len(xQ2)
+        if A.ndim != 2 or A.shape[0] != expected_n:
+            raise ValueError(
+                f"precomputed A must have {expected_n} rows, got {A.shape}."
+            )
+        if T.shape != (expected_n,) or mu.shape != (expected_n,):
+            raise ValueError(
+                "precomputed T and mu must both have shape "
+                f"{(expected_n,)}; got {T.shape} and {mu.shape}."
+            )
+        if w_norm is not None and w_norm.shape != (A.shape[1],):
+            raise ValueError(
+                f"precomputed w_norm must have shape {(A.shape[1],)}, "
+                f"got {w_norm.shape}."
+            )
+
+    if eft_offset is not None:
+        eft_offset = np.asarray(eft_offset, dtype=float)
+        if eft_offset.shape != (len(xQ2),):
+            raise ValueError(
+                f"eft_offset must have shape {(len(xQ2),)}, got {eft_offset.shape}."
+            )
 
     return {
         'PDF': pdf, 'B': B, 'A': A, 'w_norm': w_norm,
@@ -1447,6 +1900,8 @@ def setup_experiment(pdf, c, f, xQ2, grid, degree, M, W,
         'parametrize': parametrize, 'return_history': return_history,
         'loss_scale': loss_scale, 'mle_constrained': mle_constrained,
         'one_step_constrained': one_step_constrained,
+        'eft_offset': eft_offset, 'fit_validator': fit_validator,
+        'one_step_diagonal_covariance': one_step_diagonal_covariance,
     }
 
 
@@ -1507,6 +1962,11 @@ def run_single_experiment(setup_dict, diagnostics=False, show_plots=True, rng=No
     loss_scale      = setup_dict['loss_scale']
     mle_constrained = setup_dict['mle_constrained']
     one_step_constrained = setup_dict['one_step_constrained']
+    eft_offset = setup_dict.get('eft_offset')
+    fit_validator = setup_dict.get('fit_validator')
+    one_step_diagonal_covariance = setup_dict.get(
+        'one_step_diagonal_covariance', False
+    )
 
     fit_w_norm = w_norm if mle_constrained else None
     one_step_w_norm = w_norm if one_step_constrained else None
@@ -1533,12 +1993,14 @@ def run_single_experiment(setup_dict, diagnostics=False, show_plots=True, rng=No
         if return_history:
             res, history = fit_beta_c(D, A, _v_c, _v_prime_c, fit_w_norm, xQ2,
                                       Sigma=data_Sigma, beta0=beta0, c0=c0,
+                                      eft_offset=eft_offset,
                                       nonneg_beta=nonneg_beta,
                                       pin_endpoints=pin_endpoints, opt_method=beta_opt,
                                       return_history=True, loss_scale=loss_scale)
         else:
             res = fit_beta_c(D, A, _v_c, _v_prime_c, fit_w_norm, xQ2,
                              Sigma=data_Sigma, beta0=beta0, c0=c0,
+                             eft_offset=eft_offset,
                              nonneg_beta=nonneg_beta,
                              pin_endpoints=pin_endpoints, opt_method=beta_opt,
                              return_history=False, loss_scale=loss_scale)
@@ -1548,31 +2010,55 @@ def run_single_experiment(setup_dict, diagnostics=False, show_plots=True, rng=No
         if return_history:
             beta_hat, history = mle_beta(D=D, A=A, c=c0, v=_v_c, xQ2=xQ2,
                                          Sigma=data_Sigma, w_norm=fit_w_norm, beta0=beta0,
+                                         eft_offset=eft_offset,
                                          nonneg_beta=nonneg_beta, pin_endpoints=pin_endpoints,
                                          beta_opt=beta_opt, return_history=True,
                                          loss_scale=loss_scale)
         else:
             beta_hat = mle_beta(D=D, A=A, c=c0, v=_v_c, xQ2=xQ2,
                                 Sigma=data_Sigma, w_norm=fit_w_norm, beta0=beta0,
+                                eft_offset=eft_offset,
                                 nonneg_beta=nonneg_beta, pin_endpoints=pin_endpoints,
                                 beta_opt=beta_opt, return_history=False,
                                 loss_scale=loss_scale)
         c_hat = mle_c(D=D, A=A, v=_v_c, beta=beta_hat, xQ2=xQ2,
-                      Sigma=data_Sigma, c_opt=c_opt, c_range=c_range)
+                      Sigma=data_Sigma, eft_offset=eft_offset,
+                      c_opt=c_opt, c_range=c_range)
         res = {'beta_hat': beta_hat, 'c_hat': c_hat}
     else:
         raise ValueError(f"Invalid opt method: {opt!r}")
 
-    mu_hat = true_mean_basis(c_hat, beta_hat, A, xQ2, klin=_klin, kquad=_kquad)
+    if fit_validator is not None:
+        fit_validator(beta_hat)
+
+    mu_hat = true_mean_basis(
+        c_hat, beta_hat, A, xQ2, klin=_klin, kquad=_kquad,
+        eft_offset=eft_offset,
+    )
 
     # One-step update
     K       = build_K_matrix(c_hat, A, xQ2, klin=_klin, kquad=_kquad)
     K_prime = build_K_prime_matrix(c_hat, A, xQ2, klin=_klin, kquad=_kquad)
-    c_one_step, one_step_info = one_step_c(D, K, K_prime, beta_hat, c_hat,
-                                           one_step_w_norm, Sigma=data_Sigma,
-                                           pin_endpoints=pin_endpoints)
+    fixed_mean = (
+        _v_c(c_hat, xQ2) * eft_offset if eft_offset is not None else None
+    )
+    fixed_mean_prime = (
+        _v_prime_c(c_hat, xQ2) * eft_offset if eft_offset is not None else None
+    )
+    one_step_covariance = None if one_step_diagonal_covariance else data_Sigma
+    one_step_variances = (
+        np.diag(data_Sigma)
+        if one_step_diagonal_covariance and data_Sigma is not None else None
+    )
+    c_one_step, one_step_info = one_step_c(
+        D, K, K_prime, beta_hat, c_hat, one_step_w_norm,
+        Sigma=one_step_covariance, s2_diag=one_step_variances,
+        pin_endpoints=pin_endpoints, fixed_mean=fixed_mean,
+        fixed_mean_prime=fixed_mean_prime,
+    )
     mu_one_step = true_mean_basis(c_one_step, beta_hat, A, xQ2,
-                                  klin=_klin, kquad=_kquad)
+                                  klin=_klin, kquad=_kquad,
+                                  eft_offset=eft_offset)
 
     if not diagnostics:
         return c_hat, c_one_step
@@ -1663,7 +2149,9 @@ def experiment(c, f, xQ2, grid, W, degree, M,
                nonneg_beta=True, diagnostics=False, ncol_plots=4,
                x_log_scale=True, parametrize="f", return_history=False,
                mle_constrained=True, one_step_constrained=True,
-               pin_endpoints=False):
+               pin_endpoints=False, precomputed=None, eft_offset=None,
+               fit_validator=None, one_step_diagonal_covariance=False,
+               loss_scale=1):
     """
     Convenience wrapper: runs setup_experiment() then run_single_experiment().
 
@@ -1690,5 +2178,8 @@ def experiment(c, f, xQ2, grid, W, degree, M,
         mle_constrained=mle_constrained,
         one_step_constrained=one_step_constrained,
         return_history=return_history,
+        loss_scale=loss_scale, precomputed=precomputed,
+        eft_offset=eft_offset, fit_validator=fit_validator,
+        one_step_diagonal_covariance=one_step_diagonal_covariance,
     )
     return run_single_experiment(setup_dict, diagnostics)
