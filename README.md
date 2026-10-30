@@ -35,7 +35,7 @@ Both saved experiments contain 1,000 simulations and 500 bootstrap samples per f
 The numbers in each file name are the true EFT coefficient used to generate the pseudo-data (`c_true`) and the new-physics scale (`Lambda`). Each file holds three kinds of content:
 
 - **Settings:** the dataset and PDF set used, `c_true`, `Lambda`, the number of simulations and bootstrap samples, the random seed, the spline basis (degree and number of basis functions), the optimizers, and the fit constraints. The HERA file also records its sum rule and the fixed NNPDF background.
-- **Model:** the data points in $(x, Q^2)$, the covariance matrix, the design matrix, the mean used to generate the pseudo-data, and the linear and quadratic EFT terms. BCDMS has 248 data points and 8 basis functions; HERA has 67 data points and 6 free basis functions.
+- **Model:** the data points in $(x, Q^2)$, the covariance matrix, the design matrix, the mean used to generate the pseudo-data, and the linear and quadratic EFT terms. 
 - **Results:** for each of the 1,000 simulated datasets, and for both the separate and the joint fit, the MLE and one-step estimates of `c`, their standard errors, the asymptotic, one-step and bootstrap 95% intervals, and all 500 bootstrap estimates.
 
 The demo notebooks only use the results: their tables and plots are made from the stored estimates and intervals, and no fitting is done. If you start a new run (see below), the settings and model are used to generate fresh pseudo-data and fit it again.
