@@ -1,7 +1,7 @@
 # Reproducing the paper results
 
-- [BCDMS demo: T3 closure test](BCDMS_demo.ipynb)
-- [HERA demo: V closure test](HERA_demo.ipynb)
+- [BCDMS demo](BCDMS_demo.ipynb)
+- [HERA demo](HERA_demo.ipynb)
 
 Each notebook displays the saved simulation results used in the paper. Run all cells to regenerate the summary tables and plots from the included archives. New fits and simulations are optional and disabled by default.
 
@@ -45,7 +45,7 @@ rerun_bootstrap_count = int(paper["n_boot_sim"])
 
 Nested bootstrap runs can take a long time. New results remain separate from the archived `paper` results. Set `save_new_results=True` to save a uniquely named NPZ under `simulation_results/paper_reruns/`. Fit failures and optimizer warnings are recorded in `rerun_diagnostics`.
 
-This workflow reproduces the inference stage from the saved model. The research notebooks and upstream data-generation work are maintained on the [real-model-experiment branch](https://github.com/richardzhs/Semiparametric_Parameter_Estimation_PDF/tree/real-model-experiment). Library versions, optimizer initialization, and historical random-number handling can prevent exact numerical reproduction. In particular, the historical HERA bootstrap calls did not set a seed; new bootstrap draws are seeded. Use the checked archives to recover the exact saved results.
+This workflow reproduces the inference stage from the saved model. Library versions, optimizer initialization, and historical random-number handling can prevent exact numerical reproduction. In particular, the historical HERA bootstrap calls did not set a seed; new bootstrap draws are seeded. Use the checked archives to recover the exact saved results.
 
 ## Required files
 
