@@ -1,46 +1,56 @@
-# Reproducing the paper results
+# Semiparametric Estimation of Physics Parameters and PDFs
 
-There are two ways in, depending on how much control you want.
+The results can be reproduced with two kinds of notebook: demos, which show the published results, and experiments, which let you change the settings and rerun the simulation.
 
 | | Notebooks | Use these to |
 |---|---|---|
-| **Demos** | [BCDMS demo](BCDMS_demo.ipynb), [HERA demo](HERA_demo.ipynb) | Reproduce the paper's tables and plots from the saved archives. No extra setup and nothing to configure. |
-| **Experiments** | [BCDMS experiment](BCDMS_experiment.ipynb), [HERA experiment](HERA_experiment.ipynb) | Control the basis, design matrix, fitting method, and simulation settings, and rerun the study end to end. |
+| **Demos** | [BCDMS demo](BCDMS_demo.ipynb), [HERA demo](HERA_demo.ipynb) | Reproduce the paper's tables and plots from the saved experiments. No extra setup and nothing to configure. Model settings cannot be changed here. |
+| **Experiments** | [BCDMS experiment](BCDMS_experiment.ipynb), [HERA experiment](HERA_experiment.ipynb) | Change any setting (basis, design matrix, fitting method, simulation settings) and rerun the simulation end to end. Use these whenever you want different settings from the paper. |
 
-Start with a demo if you want the published numbers. Each demo notebook displays the saved simulation results used in the paper: run all cells to regenerate the summary tables and plots from the included archives. New fits and simulations are optional and disabled by default.
+Start with a demo if you want the published numbers. Each demo notebook displays the saved simulation results used in the paper: run all cells to regenerate the summary tables and plots from the included saved experiments. New fits and simulations are optional and disabled by default.
 
-## Environment and execution
+## Installation
 
-Use Python 3.11 and install the tested dependencies:
+Use Python 3.11 and install the dependencies:
 
 ```sh
 python -m pip install -r requirements-paper-demos.txt
 ```
 
-Open a notebook in a Jupyter-compatible editor, select that Python environment, and run all cells from the repository directory. If using JupyterLab, install it separately. Keep `paper_demo_utils.py` and `paper_results/` alongside the notebooks. LHAPDF is not required to read the results or refit the saved design matrices.
+Rerunning the experiment notebooks additionally requires LHAPDF with the `NNPDF40_nnlo_as_01180` set.
 
-That covers the demos completely. The experiment notebooks need one addition: LHAPDF with the `NNPDF40_nnlo_as_01180` set, which `requirements-paper-demos.txt` does not install. Reading them needs nothing extra.
+### Required files
 
-## Reading the results
-
-The notebooks show experiment settings, estimator bias and spread, finite-result counts, 95% interval coverage and widths, sampling distributions, and coverage calibration. The default comparison includes separate MLE, its one-step correction, and joint MLE with asymptotic intervals. Set `joint_ci="bootstrap"` to display the archived joint-MLE bootstrap intervals instead.
-
-Coverage uses saved interval endpoints. Calibration curves use normal intervals reconstructed from saved standard errors; they do not recompute percentile-bootstrap intervals at each confidence level. Counts in the summary table identify the replicates included in each calculation.
+Keep the two demo notebooks, `paper_demo_utils.py`, `requirements-paper-demos.txt`, and the contents of `paper_results/` together. Optional refitting also requires the repository's `utils.py`. The experiment notebooks additionally need `Dataset/data_208.npz` and `Dataset/data_HERA_F3_aZ_PID200.npz`.
 
 ## Saved experiments
 
-Both archives contain 1,000 simulations and 500 bootstrap samples per fit. `paper_results/manifest.json` records the archive paths, SHA-256 checksums, and source-notebook hashes. The included snapshots are byte-for-byte copies of the research archives. The research-archive paths below record provenance and are not required files on this branch:
+Both saved experiments contain 1,000 simulations and 500 bootstrap samples per fit.
 
-| Experiment | Research archive | Included snapshot |
-|---|---|---|
-| BCDMS | `simulation_results/BCDMS/T3_simulation_results_c=500_Lambda=500.npz` | `paper_results/T3_simulation_results_c=500_Lambda=500.npz` |
-| HERA | `simulation_results/HERA/V_simulation_results_c=2_Lambda=500.npz` | `paper_results/V_simulation_results_c=2_Lambda=500.npz` |
+| Experiment | Path                                                       |
+|---|------------------------------------------------------------|
+| BCDMS | `paper_results/T3_simulation_results_c=500_Lambda=500.npz` |
+| HERA | `paper_results/V_simulation_results_c=2_Lambda=500.npz`    |
 
-The HERA archive does not record the Hessian method used to compute its joint-MLE intervals. Those saved intervals are displayed directly; new runs explicitly use numerical Hessians.
+The numbers in each file name are the true EFT coefficient used to generate the pseudo-data (`c_true`) and the new-physics scale (`Lambda`). Each file holds three kinds of content:
+
+- **Settings:** the dataset and PDF set used, `c_true`, `Lambda`, the number of simulations and bootstrap samples, the random seed, the spline basis (degree and number of basis functions), the optimizers, and the fit constraints. The HERA file also records its sum rule and the fixed NNPDF background.
+- **Model:** the data points in $(x, Q^2)$, the covariance matrix, the design matrix, the mean used to generate the pseudo-data, and the linear and quadratic EFT terms. 
+- **Results:** for each of the 1,000 simulated datasets, and for both the separate and the joint fit, the MLE and one-step estimates of `c`, their standard errors, the asymptotic, one-step and bootstrap 95% intervals, and all 500 bootstrap estimates.
+
+The demo notebooks only use the results: their tables and plots are made from the stored estimates and intervals, and no fitting is done. If you start a new run (see below), the settings and model are used to generate fresh pseudo-data and fit it again.
+
+## Reading the results
+
+The demo notebooks show experiment settings, estimator bias and spread, finite-result counts, 95% interval coverage and widths, sampling distributions, and coverage calibration. The default comparison includes separate MLE, its one-step correction, and joint MLE with asymptotic intervals. Set `joint_ci="bootstrap"` to display the joint-MLE bootstrap intervals from the saved experiments instead.
+
+Coverage uses saved interval endpoints. Calibration curves use normal intervals reconstructed from saved standard errors; they do not recompute percentile-bootstrap intervals at each confidence level. Counts in the summary table identify the replicates included in each calculation.
 
 ## Rerunning the inference
 
-In Section 6, set `run_reproduction=True`. The helper reads the design matrix, generating mean, covariance, EFT coefficients, fixed contributions, constraints, and optimizer choices from the archive, then uses `utils.py` to refit simulated datasets. BCDMS uses full covariance in the one-step calculation; HERA uses its diagonal.
+First, in section 6 of either demo notebook ("Optional reproduction from the saved model"), set `run_reproduction=True`. 
+
+The helper reads the design matrix, generating mean, covariance, EFT coefficients, fixed contributions, constraints, and optimizer choices from the saved experiment, then uses `utils.py` to refit simulated datasets. 
 
 A small rerun defaults to 10 replicates without bootstrap. To use the paper's sample counts, set:
 
@@ -49,16 +59,10 @@ rerun_count = int(paper["N_sim"])
 rerun_bootstrap_count = int(paper["n_boot_sim"])
 ```
 
-Nested bootstrap runs can take a long time. New results remain separate from the archived `paper` results. Set `save_new_results=True` to save a uniquely named NPZ under `simulation_results/paper_reruns/`. Fit failures and optimizer warnings are recorded in `rerun_diagnostics`.
-
-This workflow reproduces the inference stage from the saved model. Library versions, optimizer initialization, and historical random-number handling can prevent exact numerical reproduction. In particular, the historical HERA bootstrap calls did not set a seed; new bootstrap draws are seeded. Use the checked archives to recover the exact saved results.
+Nested bootstrap runs can take a long time. New results remain separate from the saved experiment loaded as `paper`. Set `save_new_results=True` to save a uniquely named NPZ under `simulation_results/paper_reruns/`. Fit failures and optimizer warnings are recorded in `rerun_diagnostics`.
 
 ## Experiment notebooks
 
-[BCDMS experiment](BCDMS_experiment.ipynb) and [HERA experiment](HERA_experiment.ipynb) are the full research notebooks behind the two demos, covering basis construction, design-matrix assembly, fitting, and the simulation studies. Where a demo replays the saved results, these expose the settings that produced them and let you change any of them.
+[BCDMS experiment](BCDMS_experiment.ipynb) and [HERA experiment](HERA_experiment.ipynb) are the notebooks behind the two demos, covering basis construction, design-matrix assembly, fitting, and the simulation studies. 
 
-They read the archives in `paper_results/` together with the design-matrix inputs in `Dataset/`, and they retain their tables and plots for reading without execution. When their simulation cells are enabled, new output is written under `simulation_results/` and the archived results are left untouched.
-
-## Required files
-
-Keep the two demo notebooks, `paper_demo_utils.py`, `requirements-paper-demos.txt`, and the contents of `paper_results/` together. Optional refitting also requires the repository's `utils.py`. The notebooks retain their tables and plots for reading without execution. The experiment notebooks additionally need `Dataset/data_208.npz` and `Dataset/data_HERA_F3_aZ_PID200.npz`.
+They read the saved experiments in `paper_results/` together with the design-matrix inputs in `Dataset/`, and they retain their tables and plots for reading without execution. When their simulation cells are enabled, new output is written under `simulation_results/` and the saved experiments are left untouched.
