@@ -1,5 +1,9 @@
 # Semiparametric Estimation of Physics Parameters and PDFs
 
+[![arXiv](https://img.shields.io/badge/arXiv-2611.04267-b31b1b.svg)](https://arxiv.org/abs/2611.04267)
+
+This repository contains the code for the paper [*Semiparametric Estimation of Physics Parameters and Parton Distribution Functions*](https://arxiv.org/abs/2611.04267).
+
 The results can be reproduced with two kinds of notebook: demos, which show the published results, and experiments, which let you change the settings and rerun the simulation.
 
 | | Notebooks | Use these to |
